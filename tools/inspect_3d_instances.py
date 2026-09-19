@@ -390,15 +390,6 @@ def main():
             f"Extent={geometry.bbox_extent.round(2)}"
         )
 
-    combined_points = np.concatenate(
-        combined_points,
-        axis=0,
-    )
-    combined_instance_colors = np.concatenate(
-        combined_instance_colors,
-        axis=0,
-    )
-
     combined_path = (
         frame_output_directory
         / "instances_colored_by_id.ply"
@@ -414,21 +405,37 @@ def main():
         / "instances_3d.json"
     )
 
-    save_point_cloud(
-        output_path=combined_path,
-        points=combined_points,
-        colors=combined_instance_colors,
-    )
+    # 零实例是合法结果（该帧没有检测框）。np.concatenate / save_preview 都要求
+    # 至少一个数组，所以这里必须显式分支，否则整个序列会断在那一帧。
+    if observations:
+        combined_points = np.concatenate(
+            combined_points,
+            axis=0,
+        )
+        combined_instance_colors = np.concatenate(
+            combined_instance_colors,
+            axis=0,
+        )
 
-    camera_position = (
-        frame["camera_to_world"][:3, 3]
-    )
+        save_point_cloud(
+            output_path=combined_path,
+            points=combined_points,
+            colors=combined_instance_colors,
+        )
 
-    save_preview(
-        output_path=preview_path,
-        observations=observations,
-        camera_position=camera_position,
-    )
+        camera_position = (
+            frame["camera_to_world"][:3, 3]
+        )
+
+        save_preview(
+            output_path=preview_path,
+            observations=observations,
+            camera_position=camera_position,
+        )
+    else:
+        print(
+            "\n警告：本帧没有 3D 实例，跳过组合点云与预览，仅写出空元数据。"
+        )
 
     with metadata_path.open(
         "w",
@@ -442,8 +449,9 @@ def main():
         )
 
     print(f"\n3D 实例数量：{len(observations)}")
-    print(f"组合实例点云：{combined_path.resolve()}")
-    print(f"3D 预览：{preview_path.resolve()}")
+    if observations:
+        print(f"组合实例点云：{combined_path.resolve()}")
+        print(f"3D 预览：{preview_path.resolve()}")
     print(f"3D 元数据：{metadata_path.resolve()}")
 
 

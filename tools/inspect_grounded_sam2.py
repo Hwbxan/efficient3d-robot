@@ -220,24 +220,32 @@ def main():
         perf_counter() - detection_start
     ) * 1000.0
 
-    if not detections:
-        raise RuntimeError(
-            "Grounding DINO 没有产生检测框"
+    # 零检测是合法结果（镜头正对墙面/地板，或检测框全被面积过滤剔除），
+    # 不能当成致命错误——否则整个序列跑到那一帧就断了。
+    # 下游 read_records 明确允许空列表，所以这里只写空实例列表并继续。
+    if detections:
+        boxes_xyxy = np.stack(
+            [
+                detection.box_xyxy
+                for detection in detections
+            ]
         )
-
-    boxes_xyxy = np.stack(
-        [
-            detection.box_xyxy
-            for detection in detections
-        ]
-    )
+    else:
+        boxes_xyxy = np.zeros((0, 4), dtype=np.float32)
+        print(
+            "\n警告：本帧没有任何检测框（可能被 --max-box-area-fraction "
+            f"{arguments.max_box_area_fraction} 全部剔除），写入空实例列表。"
+        )
 
     segmentation_start = perf_counter()
 
-    instance_masks = segmenter.predict(
-        rgb=frame["rgb"],
-        boxes_xyxy=boxes_xyxy,
-    )
+    if len(boxes_xyxy):
+        instance_masks = segmenter.predict(
+            rgb=frame["rgb"],
+            boxes_xyxy=boxes_xyxy,
+        )
+    else:
+        instance_masks = []
 
     segmentation_time_ms = (
         perf_counter() - segmentation_start
