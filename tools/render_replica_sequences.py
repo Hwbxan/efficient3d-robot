@@ -94,7 +94,7 @@ def quaternion_to_matrix(q) -> np.ndarray:
     )
 
 
-def camera_to_world_stage(state, sensor_offset) -> np.ndarray:
+def camera_to_world_stage(state, sensor_offset, sensor_position=None, sensor_rotation=None) -> np.ndarray:
     """把 habitat 的 agent 状态转成**场景坐标系**下的 4x4 camera-to-world。
 
     相机轴映射是**实测标定**出来的，不是推导的。做法（见
@@ -117,20 +117,29 @@ def camera_to_world_stage(state, sensor_offset) -> np.ndarray:
     rotation = quaternion_to_matrix(state.rotation)          # agent -> world
     position = np.asarray(state.position, dtype=np.float64)
 
-    centre_world = position + rotation @ np.asarray(sensor_offset, dtype=np.float64)
+    if sensor_position is not None:
+        # habitat 已经给出了相机的世界位置（sensor_states），直接用它 ——
+        # 比拿 agent 位置 + 偏移去猜更可靠。
+        centre_world = np.asarray(sensor_position, dtype=np.float64)
+        if sensor_rotation is not None:
+            rotation = quaternion_to_matrix(sensor_rotation)
+    else:
+        centre_world = position + rotation @ np.asarray(
+            sensor_offset, dtype=np.float64
+        )
 
-    # 每列是一个相机轴（在 agent 局部系里表达）
-    axes_local = R_STAGE_TO_WORLD.T
-    axes_world = rotation @ axes_local
-
-    # 世界 -> 场景系
+    # 世界 -> 场景系只做一次轴置换：R_STAGE_TO_WORLD 把场景系（Z 朝上）映射到
+    # habitat 世界系（Y 朝上），所以它的转置才是 world -> stage。
+    #
+    # 实测（/tmp/probe2.py，office_1 导航点 y=-0.848 处反投影图像底部）：
+    #   world_to_stage @ R          -> 地面 z=-0.799，误差 0.049 m   ✅
+    #   world_to_stage @ (R @ Rsw^T) -> 地面 z=-0.209，误差 0.639 m  ❌（旧实现）
+    # 旧实现多夹了一层 R_STAGE_TO_WORLD 转置，把相机轴又转了一次，俯仰因此
+    # 完全错位（渲染出 41% 的帧在仰视天花板，真实序列只有 3%）。
     world_to_stage = R_STAGE_TO_WORLD.T
-    axes_stage = world_to_stage @ axes_world
-    centre_stage = world_to_stage @ centre_world
-
     pose = np.eye(4, dtype=np.float64)
-    pose[:3, :3] = axes_stage
-    pose[:3, 3] = centre_stage
+    pose[:3, :3] = world_to_stage @ rotation
+    pose[:3, 3] = world_to_stage @ centre_world
     return pose
 
 
@@ -268,11 +277,20 @@ def floor_height_check(depth_m: np.ndarray, pose: np.ndarray, reference_height: 
     }
 
 
-def frame_is_usable(depth_m: np.ndarray, rgb: np.ndarray) -> tuple[bool, str]:
+def frame_is_usable(depth_m: np.ndarray, rgb: np.ndarray,
+                    min_median_depth: float) -> tuple[bool, str]:
     """过滤退化视角。
 
     随机采样导航点经常会给出「相机贴在墙里 / 被包在几何体内」的视角，
     表现为大面积零深度或整幅过暗。这类帧留着会污染数据集，直接丢掉。
+
+    更隐蔽的问题是「贴脸」：Replica 的导航网格本身就紧贴障碍物（实测
+    `distance_to_closest_obstacle` 中位数只有 0.17 m，最大值不到 0.9 m），
+    所以随机游走给出的位置几乎都在墙边/桌边；再让偏航跟着移动方向乱转，
+    相机就经常正对着近处的表面。实测 office_1 有 77% 的帧中位深度不到
+    1.2 m（真实 Replica 序列是 1.98 m），画面糊成一片，2D 检测器什么都
+    检不到 —— 而且相机一旦穿进几何体，渲染深度与光线投射深度会命中不同的
+    面，GT 对齐误差直接到 0.34 m。用最小中位深度把这类视角滤掉。
     """
 
     empty_fraction = float((depth_m <= 0.05).mean())
@@ -282,8 +300,18 @@ def frame_is_usable(depth_m: np.ndarray, rgb: np.ndarray) -> tuple[bool, str]:
     if float(rgb.mean()) < 25.0:
         return False, f"过暗（均值 {float(rgb.mean()):.1f}）"
 
-    if float(np.median(depth_m[depth_m > 0.05])) > 8.0:
-        return False, "中位深度超过 8 m"
+    valid = depth_m[depth_m > 0.05]
+    if valid.size == 0:
+        return False, "无有效深度"
+
+    median_depth = float(np.median(valid))
+    if median_depth > 8.0:
+        return False, f"中位深度 {median_depth:.2f} m 超过 8 m"
+
+    if median_depth < min_median_depth:
+        return False, (
+            f"贴脸（中位深度 {median_depth:.2f} m < {min_median_depth:.2f} m）"
+        )
 
     return True, ""
 
@@ -292,6 +320,9 @@ def render_scene(args) -> dict:
     # 注意：`e3d-habitat` 环境里**没有 cv2**（只有 habitat-sim + numpy + PIL），
     # 所以这里用 PIL 写图。uint16 的 PNG 用 PIL 直接存会得到 mode 'I;16'，
     # 与官方发布的一致。
+    import habitat_sim as _habitat_sim_module  # noqa: F401  (供 AgentState 使用)
+    global habitat_sim
+    habitat_sim = _habitat_sim_module
     from PIL import Image
     from habitat_sim.utils.common import quat_from_angle_axis
 
@@ -313,8 +344,13 @@ def render_scene(args) -> dict:
     agent = sim.get_agent(0)
     sensor_offset = [0.0, CAMERA_HEIGHT, 0.0]
 
-    print(f"规划 {args.frames} 帧轨迹（步长 {args.step} m）", flush=True)
-    positions, _ = plan_trajectory(sim, args.frames, args.step, args.seed)
+    # 过采样：退化视角会被 frame_is_usable 丢掉，所以要多规划一些候选位姿。
+    candidate_count = max(args.frames * args.oversample, args.frames + 32)
+    print(
+        f"规划 {candidate_count} 个候选位姿（目标 {args.frames} 帧，步长 {args.step} m）",
+        flush=True,
+    )
+    positions, _ = plan_trajectory(sim, candidate_count, args.step, args.seed)
     print(f"实际得到 {len(positions)} 个位姿", flush=True)
     if len(positions) < 2:
         raise RuntimeError("轨迹规划失败：导航点太少")
@@ -324,6 +360,9 @@ def render_scene(args) -> dict:
     skipped = []
     written = 0
     for index, position in enumerate(positions):
+        if written >= args.frames:
+            break
+
         # 朝向下一段，形成连续运动。
         #
         # 偏航轴是 **Z**（场景系的上方向），不是 Y。相机前向在场景系里是
@@ -333,23 +372,56 @@ def render_scene(args) -> dict:
             delta = positions[index + 1] - position
         else:
             delta = position - positions[index - 1]
+        # 只用**水平**位移定朝向：Replica 的导航网格有起伏，直接把三维位移
+        # 喂给 arctan2 会让相邻点的高度差变成俯仰角，相机于是频繁仰头看天花板
+        # （实测 41% 的帧朝上，而真实 Replica 序列 82% 是朝下的）。
         yaw = np.degrees(np.arctan2(-float(delta[0]), float(delta[2])))
 
         state = agent.get_state()
         state.position = np.asarray(position, dtype=np.float32)
         state.rotation = quat_from_angle_axis(np.deg2rad(yaw), np.array([0.0, 0.0, 1.0]))
-        agent.set_state(state)
+
+        # 相机姿态必须显式写进 sensor_states，并以 infer_sensor_states=False
+        # 提交 —— 否则 habitat 会按 sensor spec 重新推断外参，把这里的设置丢掉。
+        #
+        # 为什么非改不可：sensor spec 让光轴沿 agent 的 -Z_local，而那正是导航
+        # 网格的**上**方向，所以默认渲染是「仰头看天花板」（实测 41% 的帧朝上，
+        # 真实 Replica 序列是 82% 朝下）。Replica 净高只有 1.4~1.5 m，相机又挂在
+        # 1.25 m，一抬头就直接顶到天花板上。
+        # 改成绕 Z 轴的偏航（光轴水平）+ 可调俯仰，俯仰就不再受网格起伏影响。
+        rotation = quat_from_angle_axis(
+            np.deg2rad(yaw + args.pitch_deg), np.array([0.0, 0.0, 1.0])
+        )
+        state.sensor_states["color_sensor"] = habitat_sim.AgentState(
+            position=np.asarray(position, dtype=np.float32)
+            + np.array([0.0, CAMERA_HEIGHT, 0.0], dtype=np.float32),
+            rotation=rotation,
+        )
+        state.sensor_states["depth_sensor"] = habitat_sim.AgentState(
+            position=np.asarray(position, dtype=np.float32)
+            + np.array([0.0, CAMERA_HEIGHT, 0.0], dtype=np.float32),
+            rotation=rotation,
+        )
+        agent.set_state(state, infer_sensor_states=False)
 
         observations = sim.get_sensor_observations()
         rgb = np.asarray(observations["color_sensor"])[..., :3]
         depth_m = np.asarray(observations["depth_sensor"]).astype(np.float32)
 
-        usable, reason = frame_is_usable(depth_m, rgb)
+        usable, reason = frame_is_usable(depth_m, rgb, args.min_median_depth)
         if not usable:
             skipped.append({"index": index, "reason": reason})
             continue
 
-        pose = camera_to_world_stage(agent.get_state(), sensor_offset)
+        # 用 habitat 回读出来的真实传感器位姿，避免自己推算偏移出错。
+        final_state = agent.get_state()
+        final_sensor = final_state.sensor_states.get("color_sensor")
+        pose = camera_to_world_stage(
+            final_state,
+            sensor_offset,
+            sensor_position=getattr(final_sensor, "position", None),
+            sensor_rotation=getattr(final_sensor, "rotation", None),
+        )
         poses.append(pose)
 
         # 自检：底部应当落在地面上（导航网格高度 = 场景系里的地面 z）
@@ -430,6 +502,14 @@ def parse_arguments():
     parser.add_argument("--frames", type=int, default=300)
     parser.add_argument("--step", type=float, default=0.25)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--oversample", type=int, default=4,
+                        help="候选位姿 = frames*oversample，过滤退化视角后取前 frames 个")
+    parser.add_argument("--pitch-deg", type=float, default=0.0,
+                        help="额外俯仰角（度）。0=光轴水平；负值=略微俯视。"
+                             "真实 Replica 序列 82%% 的帧是朝下的，可用 -15 贴近该统计")
+    parser.add_argument("--min-median-depth", type=float, default=1.2,
+                        help="丢弃中位深度小于该值的「贴脸」视角（米）。"
+                             "真实 Replica 序列的中位深度约 1.98 m")
     return parser.parse_args()
 
 

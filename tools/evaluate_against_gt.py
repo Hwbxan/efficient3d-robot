@@ -25,15 +25,20 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+# 预测端用的是开放词汇提示词，GT 端用的是 Replica 的语义类名，两边命名不同。
+# 这里把每个提示词映射到它合理的 GT 类别集合；注意必须包含同名的那个类
+# （例如提示词 "desk" 也要能匹配 GT 里就叫 "desk" 的物体，否则会被误判成
+# 标签不一致）。办公室场景里大量的桌子标注为 desk / monitor，早期版本漏掉
+# 这两个类，导致它们被排除在 GT 之外、检测器检出后反被算成 FP。
 LABEL_SYNONYMS = {
-    "trash can": {"bin", "tissue-paper"},
-    "computer monitor": {"tv-screen", "tablet"},
-    "chair": {"chair", "sofa"},
-    "desk": {"table", "desk-organizer", "panel"},
+    "trash can": {"bin", "tissue-paper", "basket"},
+    "computer monitor": {"tv-screen", "tablet", "monitor"},
+    "chair": {"chair", "sofa", "stool", "armchair"},
+    "desk": {"table", "desk", "desk-organizer", "panel"},
     "door": {"door"},
-    "sofa": {"sofa"},
-    "couch": {"sofa"},
-    "table": {"table"},
+    "sofa": {"sofa", "couch"},
+    "couch": {"sofa", "couch"},
+    "table": {"table", "desk"},
     "plant": {"indoor-plant", "plant-stand"},
 }
 

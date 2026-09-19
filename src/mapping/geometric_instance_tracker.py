@@ -92,17 +92,28 @@ class GeometricInstanceTracker:
         unmatched_cost=0.65,
         ambiguity_margin=0.08,
         shape_weight=0.25,
+        memory_frames=30,
+        reacquire_max_center_distance=1.5,
+        reacquire_max_bbox_gap=0.30,
     ):
         if max_center_distance <= 0 or max_bbox_gap <= 0:
             raise ValueError("距离门限必须大于 0")
         if not 0.0 <= shape_weight <= 1.0:
             raise ValueError("shape_weight 必须在 [0, 1] 内")
+        if reacquire_max_center_distance < max_center_distance:
+            raise ValueError("reacquire_max_center_distance 必须 ≥ max_center_distance")
 
         self.max_center_distance = max_center_distance
         self.max_bbox_gap = max_bbox_gap
         self.unmatched_cost = unmatched_cost
         self.ambiguity_margin = ambiguity_margin
         self.shape_weight = shape_weight
+        # 重新捕获：物体短暂消失后重现时，相机已移动，其质心可能距旧轨最后
+        # 位置超过常规门限；对「近期出现过（last_seen 在 memory_frames 内）」
+        # 的轨道放宽门限，避免被拒而开新轨（过分割的 association_no_candidate）。
+        self.memory_frames = memory_frames
+        self.reacquire_max_center_distance = reacquire_max_center_distance
+        self.reacquire_max_bbox_gap = reacquire_max_bbox_gap
 
         self.tracks = {}
         self.next_global_id = 1
@@ -124,60 +135,90 @@ class GeometricInstanceTracker:
 
         return global_id
 
-    def _association_cost(self, observation, track):
+    def _gate(self, observation, track, frame_index=None):
+        """返回 (cost, max_center, max_bbox)。
+
+        frame_index 为 None（或轨道近期未出现）时用严格门限；否则用放宽门限
+        （重新捕获）。代价归一化随所用门限缩放，保证同一个移动量在放宽门限下
+        代价更小、更易被重新捕获。
+        """
+
         center_distance, bbox_gap = geometry_distances(
             observation,
             track.latest_observation,
         )
-
-        if (
-            center_distance > self.max_center_distance
-            or bbox_gap > self.max_bbox_gap
-        ):
-            return np.inf
-
-        observed_label = observation["label"].strip().lower()
-
-        # 不确定标签仅提供较弱的类别证据。
-        if observed_label not in KNOWN_LABELS or track.label == "unknown":
-            label_penalty = 0.5
-        elif observed_label == track.label:
-            label_penalty = 0.0
+        if frame_index is not None:
+            gap = frame_index - track.last_seen_frame
         else:
-            label_penalty = 1.0
+            gap = -1
+        if gap >= 0 and gap <= self.memory_frames:
+            max_center = self.reacquire_max_center_distance
+            max_bbox = self.reacquire_max_bbox_gap
+        else:
+            max_center = self.max_center_distance
+            max_bbox = self.max_bbox_gap
 
-        # ---- Stage 5c：shape embedding cosine similarity ----
-        shape_cost = 0.0
-        has_shape = False
+        if center_distance > max_center or bbox_gap > max_bbox:
+            return np.inf, max_center, max_bbox
+        return None, max_center, max_bbox
+
+    def _label_penalty(self, observation, track):
+        observed_label = observation["label"].strip().lower()
+        if observed_label not in KNOWN_LABELS or track.label == "unknown":
+            return 0.5
+        if observed_label == track.label:
+            return 0.0
+        return 1.0
+
+    def _shape_cost(self, observation, track):
+        """返回 (shape_cost, has_shape)；无 shape embedding 时 has_shape=False。"""
+
         obs_shape = observation.get("shape_embedding")
         track_shape = track.latest_observation.get("shape_embedding")
-        if obs_shape is not None and track_shape is not None:
-            a = np.asarray(obs_shape, dtype=np.float32)
-            b = np.asarray(track_shape, dtype=np.float32)
-            norm = np.linalg.norm(a) * np.linalg.norm(b)
-            if norm > 1e-8:
-                sim = float(np.dot(a, b) / norm)
-                # 映射到 [0, 1]：完全相似 → 0，完全相反 → 1
-                shape_cost = (1.0 - sim) * 0.5
-                has_shape = True
+        if obs_shape is None or track_shape is None:
+            return 0.0, False
+        a = np.asarray(obs_shape, dtype=np.float32)
+        b = np.asarray(track_shape, dtype=np.float32)
+        norm = np.linalg.norm(a) * np.linalg.norm(b)
+        if norm <= 1e-8:
+            return 0.0, False
+        sim = float(np.dot(a, b) / norm)
+        return (1.0 - sim) * 0.5, True
+
+    def _association_cost(self, observation, track, frame_index=None):
+        """严格门限的关联代价（第一遍匹配用）。"""
+
+        inf, max_center, max_bbox = self._gate(observation, track, frame_index)
+        if inf is not None:
+            return inf
+
+        label_penalty = self._label_penalty(observation, track)
+        shape_cost, has_shape = self._shape_cost(observation, track)
 
         if has_shape and self.shape_weight > 0.0:
-            # 保留几何+标签项，但把它们的权重缩放到 (1 - shape_weight)
             base = (
-                0.70 * center_distance / self.max_center_distance
-                + 0.20 * bbox_gap / self.max_bbox_gap
+                0.70 * geometry_distances(observation, track.latest_observation)[0] / max_center
+                + 0.20 * geometry_distances(observation, track.latest_observation)[1] / max_bbox
                 + 0.10 * label_penalty
             )
             return (1.0 - self.shape_weight) * base + self.shape_weight * shape_cost
 
+        center_distance, bbox_gap = geometry_distances(observation, track.latest_observation)
         return (
-            0.70 * center_distance / self.max_center_distance
-            + 0.20 * bbox_gap / self.max_bbox_gap
+            0.70 * center_distance / max_center
+            + 0.20 * bbox_gap / max_bbox
             + 0.10 * label_penalty
         )
 
     def update(self, observations, frame_index):
-        """返回当前帧局部 ID 到全局 ID 的关联结果。"""
+        """返回当前帧局部 ID 到全局 ID 的关联结果。
+
+        两遍匹配：
+        1. 严格门限匹配（与原行为一致，不产生新歧义）；
+        2. 仅对「严格匹配失败」的新观测，用放宽门限重新捕获近期出现过的休眠
+           轨道（物体短暂消失后重现、相机已移动导致质心超严格门限）。要求唯一
+           候选以避免误合并。
+        """
 
         if (
             self.last_processed_frame is not None
@@ -195,6 +236,7 @@ class GeometricInstanceTracker:
         observation_count = len(observations)
         track_count = len(previous_tracks)
 
+        # ---- Pass 1：严格门限匹配 ----
         pair_costs = np.full(
             (observation_count, track_count),
             np.inf,
@@ -202,10 +244,7 @@ class GeometricInstanceTracker:
 
         for row, observation in enumerate(observations):
             for column, track in enumerate(previous_tracks):
-                pair_costs[row, column] = self._association_cost(
-                    observation,
-                    track,
-                )
+                pair_costs[row, column] = self._association_cost(observation, track)
 
         # 仅保留比“不匹配”更划算的候选。
         eligible = pair_costs < self.unmatched_cost
@@ -242,6 +281,7 @@ class GeometricInstanceTracker:
         rows, columns = linear_sum_assignment(assignment_costs)
         assignments = dict(zip(rows.tolist(), columns.tolist()))
 
+        matched_this_frame = set()
         results = []
 
         for row, observation in enumerate(observations):
@@ -262,6 +302,7 @@ class GeometricInstanceTracker:
                 track.last_seen_frame = frame_index
                 track.observation_count += 1
                 add_label_vote(track, observation)
+                matched_this_frame.add(track.global_id)
 
                 result.update(
                     global_id=track.global_id,
@@ -273,22 +314,54 @@ class GeometricInstanceTracker:
                 result["decision"] = "deferred_ambiguous"
 
             elif eligible[row].any():
-                # 合理候选已分配给其他观测。
-                # 暂缓处理，避免立即创建重复实例。
                 result["decision"] = "deferred_conflict"
 
             else:
-                global_id = self._create_track(
-                    observation,
-                    frame_index,
-                )
-
-                result.update(
-                    global_id=global_id,
-                    decision="new_tentative",
-                )
+                result["decision"] = "new_tentative"
 
             results.append(result)
+
+        # ---- Pass 2：重新捕获（仅对严格匹配失败的新观测）----
+        for row, observation in enumerate(observations):
+            if results[row]["decision"] != "new_tentative":
+                continue
+            best_column = None
+            best_cost = self.unmatched_cost
+            for column, track in enumerate(previous_tracks):
+                if track.global_id in matched_this_frame:
+                    continue
+                gap = frame_index - track.last_seen_frame
+                if gap < 0 or gap > self.memory_frames:
+                    continue
+                cost = self._association_cost(observation, track, frame_index)
+                if np.isfinite(cost) and cost < best_cost:
+                    best_cost = cost
+                    best_column = column
+            if best_column is not None:
+                track = previous_tracks[best_column]
+                track.latest_observation = observation
+                track.last_seen_frame = frame_index
+                track.observation_count += 1
+                add_label_vote(track, observation)
+                matched_this_frame.add(track.global_id)
+                results[row].update(
+                    global_id=track.global_id,
+                    decision="matched",
+                    association_cost=float(best_cost),
+                )
+
+        # ---- 兜底：重新捕获也失败的观测才真正新建轨道 ----
+        # （与原行为一致：deferred_* 一律不建轨，避免重复实例）
+        for row, observation in enumerate(observations):
+            if results[row]["decision"] != "new_tentative":
+                continue
+
+            global_id = self._create_track(observation, frame_index)
+
+            results[row].update(
+                global_id=global_id,
+                decision="new_tentative",
+            )
 
         return results
 
