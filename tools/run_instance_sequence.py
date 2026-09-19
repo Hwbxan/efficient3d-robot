@@ -141,11 +141,15 @@ def prepare_frame(args, frame, run_directory):
             lifting_source = str(cached_points)
             print("  已复制六帧基线的世界坐标点云", flush=True)
         else:
-            run_module("tools.inspect_3d_instances", [
+            lifting_args = [
                 "--scene-directory", args.scene_directory, "--frame-index", frame,
                 "--instance-json", segmentation_json, "--pixel-stride", args.pixel_stride,
                 "--erosion-iterations", args.erosion_iterations, "--output-directory", instances,
-            ], run_directory / "logs" / f"{name}_lifting.log")
+            ]
+            if args.encoder_weights is not None:
+                lifting_args += ["--encoder-weights", args.encoder_weights]
+            run_module("tools.inspect_3d_instances", lifting_args,
+                       run_directory / "logs" / f"{name}_lifting.log")
             lifting_source = "new_lifting"
         validate_frame(segmentation_json, instance_json)
         save_json(lifting_done, {"source": lifting_source})
@@ -228,6 +232,12 @@ def main():
     parser.add_argument("--erosion-iterations", type=int, default=1)
     parser.add_argument("--voxel-size", type=float, default=0.02)
     parser.add_argument("--reuse-baseline", action="store_true", help="复用旧目录中 0、10、20、30、40、50 帧的结果")
+    parser.add_argument(
+        "--encoder-weights",
+        type=Path,
+        default=None,
+        help="Stage-5 点式 encoder 权重路径（提供则在 3D 提升时提取 shape_embedding）",
+    )
     args = parser.parse_args()
 
     if args.frames[0] < 0 or any(b <= a for a, b in zip(args.frames, args.frames[1:])):
@@ -252,6 +262,9 @@ def main():
 
     config = vars(args).copy()
     config["run_directory"] = str(run_directory)
+    # Path 对象不可 JSON 序列化
+    if config.get("encoder_weights") is not None:
+        config["encoder_weights"] = str(config["encoder_weights"])
     config["cache_provenance_note"] = "旧缓存未记录完整生成配置，复用时由用户确认参数一致。"
     config_path = run_directory / "run_config.json"
     if config_path.is_file():

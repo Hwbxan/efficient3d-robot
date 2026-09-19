@@ -482,3 +482,76 @@ def encode_cloud_in_blocks(model, features, num_points=8192, overlap=0.1,
         outputs.get("instance_embedding"),
         outputs.get("text_embedding"),
     )
+
+
+@torch.no_grad()
+def encode_single_instance(model, points, colors, normals=None,
+                           device=None, pool="max"):
+    """对单个实例点云提取实例级 shape / CLIP 嵌入。
+
+    与 `encode_cloud_in_blocks` 不同：
+    - 不做分块（单个实例通常只有几百~几千点）；
+    - 直接返回**聚合到实例级别**的嵌入，不是逐点结果；
+    - 自动安全处理颜色范围（推断 [0,255] 还是 [0,1]）。
+
+    Parameters
+    ----------
+    model : PointEncoder
+    points : (N, 3) ndarray, world coordinates
+    colors : (N, 3) ndarray, RGB
+    normals : (N, 3) ndarray or None
+    device : torch.device
+    pool : str
+        "max" | "mean"，逐点特征的聚合方式。max 保留最具判别性的局部特征。
+
+    Returns
+    -------
+    dict with keys:
+        shape_embedding : (D_shape,) ndarray, float32, L2 normalized
+        clip_embedding  : (D_clip,) ndarray, float32, L2 normalized
+        semantic_logits : (num_classes,) ndarray, float32
+    """
+    import numpy as np
+
+    device = device or next(model.parameters()).device
+
+    N = len(points)
+    features = np.zeros((N, 9), dtype=np.float32)
+    features[:, :3] = np.asarray(points, dtype=np.float32)
+    if normals is not None:
+        features[:, 3:6] = np.asarray(normals, dtype=np.float32)
+
+    c = np.asarray(colors, dtype=np.float32)
+    if c.max() > 1.0 + 1e-3:
+        c = c / 255.0
+    features[:, 6:9] = c
+
+    features_t = torch.from_numpy(features).to(device).float()
+    features_t = normalise_block(features_t)
+
+    model.eval()
+    output = model(features_t.unsqueeze(0))          # (1, N, C)
+
+    # ---- shape embedding (FP 最终逐点特征) ----
+    point_feat = output.point_features[0]            # (N, D_shape)
+    if pool == "max":
+        agg = point_feat.max(dim=0).values
+    elif pool == "mean":
+        agg = point_feat.mean(dim=0)
+    else:
+        raise ValueError(f"pool={pool!r}，只支持 max / mean")
+    shape_emb = F.normalize(agg.unsqueeze(0), dim=-1).squeeze(0).cpu().numpy()
+
+    # ---- CLIP 语义嵌入（mean pool，模型已做 L2 归一化） ----
+    text_emb = output.text_embedding[0]              # (N, D_clip)
+    clip_agg = text_emb.mean(dim=0)
+    clip_emb = F.normalize(clip_agg.unsqueeze(0), dim=-1).squeeze(0).cpu().numpy()
+
+    # ---- 语义 logits（mean pool） ----
+    sem_logits = output.semantic_logits[0].mean(dim=0).cpu().numpy()
+
+    return {
+        "shape_embedding": shape_emb.astype(np.float32),
+        "clip_embedding": clip_emb.astype(np.float32),
+        "semantic_logits": sem_logits.astype(np.float32),
+    }

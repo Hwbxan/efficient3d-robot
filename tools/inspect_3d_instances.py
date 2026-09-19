@@ -65,6 +65,13 @@ def parse_arguments():
         default=Path("outputs/instances_3d"),
     )
 
+    parser.add_argument(
+        "--encoder-weights",
+        type=Path,
+        default=None,
+        help="Stage-5 点式 encoder 权重路径（提供则提取 shape_embedding）",
+    )
+
     return parser.parse_args()
 
 
@@ -271,6 +278,27 @@ def main():
     ) as file:
         instance_metadata = json.load(file)
 
+    # ---- Stage 5c：可选加载点式 encoder ----
+    encoder = None
+    device = None
+    if arguments.encoder_weights is not None:
+        import torch
+        from src.models.point_encoder import (
+            PointEncoderConfig,
+            PointEncoder,
+            encode_single_instance,
+        )
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        ckpt = torch.load(arguments.encoder_weights, map_location=device)
+        cfg = PointEncoderConfig(**ckpt["config"])
+        encoder = PointEncoder(cfg)
+        encoder.load_state_dict(ckpt["model"])
+        encoder.to(device).eval()
+        print(
+            f"[encoder] 已加载 {arguments.encoder_weights} "
+            f"({sum(p.numel() for p in encoder.parameters()):,} 参数) -> {device}"
+        )
+
     frame_output_directory = (
         arguments.output_directory
         / f"frame_{frame['frame_id']:06d}"
@@ -364,30 +392,43 @@ def main():
             instance_colors
         )
 
-        output_metadata.append(
-            {
-                "local_instance_id": instance_id,
-                "label": label,
-                "detection_score": metadata["detection_score"],
-                "sam_predicted_iou": metadata["sam_predicted_iou"],
-                "point_count": len(geometry.points_world),
-                "valid_depth_ratio": geometry.valid_depth_ratio,
-                "median_depth_m": geometry.median_depth_m,
-                "centroid_world": geometry.centroid.tolist(),
-                "bbox_min_world": geometry.bbox_min.tolist(),
-                "bbox_max_world": geometry.bbox_max.tolist(),
-                "bbox_extent_m": geometry.bbox_extent.tolist(),
-                "point_cloud_path": str(individual_path),
-            }
-        )
+        meta_entry = {
+            "local_instance_id": instance_id,
+            "label": label,
+            "detection_score": metadata["detection_score"],
+            "sam_predicted_iou": metadata["sam_predicted_iou"],
+            "point_count": len(geometry.points_world),
+            "valid_depth_ratio": geometry.valid_depth_ratio,
+            "median_depth_m": geometry.median_depth_m,
+            "centroid_world": geometry.centroid.tolist(),
+            "bbox_min_world": geometry.bbox_min.tolist(),
+            "bbox_max_world": geometry.bbox_max.tolist(),
+            "bbox_extent_m": geometry.bbox_extent.tolist(),
+            "point_cloud_path": str(individual_path),
+        }
 
+        if encoder is not None and len(geometry.points_world) >= 30:
+            emb = encode_single_instance(
+                encoder,
+                points=geometry.points_world,
+                colors=geometry.colors,
+                device=device,
+                pool="max",
+            )
+            meta_entry["shape_embedding"] = emb["shape_embedding"].tolist()
+            meta_entry["clip_embedding"] = emb["clip_embedding"].tolist()
+            meta_entry["semantic_logits"] = emb["semantic_logits"].tolist()
+
+        output_metadata.append(meta_entry)
+
+        shape_tag = " [shape]" if "shape_embedding" in meta_entry else ""
         print(
             f"{instance_id:02d} | "
             f"{label:18s} | "
             f"Points={len(geometry.points_world):6d} | "
             f"Depth={geometry.median_depth_m:.2f} m | "
             f"Valid={geometry.valid_depth_ratio:.3f} | "
-            f"Extent={geometry.bbox_extent.round(2)}"
+            f"Extent={geometry.bbox_extent.round(2)}{shape_tag}"
         )
 
     combined_path = (

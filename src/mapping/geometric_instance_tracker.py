@@ -79,7 +79,11 @@ def geometry_distances(first, second):
 
 
 class GeometricInstanceTracker:
-    """面向短序列、静态场景的几何关联基线。"""
+    """面向短序列、静态场景的几何关联基线。
+
+    Stage 5c 扩展：支持可选的 shape embedding（来自 PointEncoder 的
+    FP 层逐点特征 max-pool），用于增强几何关联的判别力。
+    """
 
     def __init__(
         self,
@@ -87,14 +91,18 @@ class GeometricInstanceTracker:
         max_bbox_gap=0.10,
         unmatched_cost=0.65,
         ambiguity_margin=0.08,
+        shape_weight=0.25,
     ):
         if max_center_distance <= 0 or max_bbox_gap <= 0:
             raise ValueError("距离门限必须大于 0")
+        if not 0.0 <= shape_weight <= 1.0:
+            raise ValueError("shape_weight 必须在 [0, 1] 内")
 
         self.max_center_distance = max_center_distance
         self.max_bbox_gap = max_bbox_gap
         self.unmatched_cost = unmatched_cost
         self.ambiguity_margin = ambiguity_margin
+        self.shape_weight = shape_weight
 
         self.tracks = {}
         self.next_global_id = 1
@@ -137,6 +145,30 @@ class GeometricInstanceTracker:
             label_penalty = 0.0
         else:
             label_penalty = 1.0
+
+        # ---- Stage 5c：shape embedding cosine similarity ----
+        shape_cost = 0.0
+        has_shape = False
+        obs_shape = observation.get("shape_embedding")
+        track_shape = track.latest_observation.get("shape_embedding")
+        if obs_shape is not None and track_shape is not None:
+            a = np.asarray(obs_shape, dtype=np.float32)
+            b = np.asarray(track_shape, dtype=np.float32)
+            norm = np.linalg.norm(a) * np.linalg.norm(b)
+            if norm > 1e-8:
+                sim = float(np.dot(a, b) / norm)
+                # 映射到 [0, 1]：完全相似 → 0，完全相反 → 1
+                shape_cost = (1.0 - sim) * 0.5
+                has_shape = True
+
+        if has_shape and self.shape_weight > 0.0:
+            # 保留几何+标签项，但把它们的权重缩放到 (1 - shape_weight)
+            base = (
+                0.70 * center_distance / self.max_center_distance
+                + 0.20 * bbox_gap / self.max_bbox_gap
+                + 0.10 * label_penalty
+            )
+            return (1.0 - self.shape_weight) * base + self.shape_weight * shape_cost
 
         return (
             0.70 * center_distance / self.max_center_distance
