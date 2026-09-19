@@ -20,7 +20,13 @@ class Detection:
 
 
 class GroundingDinoDetector:
-    """Grounding DINO 开放词汇目标检测器。"""
+    """Grounding DINO 开放词汇目标检测器。
+
+    默认启用"逐类别解析标签"：processor 自带的短语解码会把跨多个类别的
+    token 跨度拼成一个复合标签（如 "chair desk trash"），这种标签无法与任何
+    已知类别比较。这里改为在同一份 logits 上按类别取最大概率再取 argmax，
+    得到单一类别，且不增加前向传播次数。
+    """
 
     def __init__(
         self,
@@ -45,6 +51,81 @@ class GroundingDinoDetector:
             .eval()
         )
 
+    def category_token_groups(self, prompt: str, categories: List[str]):
+        """把 prompt 中的 token 归属到各个类别。
+
+        prompt 由 ". ".join(categories) + "." 构造，因此每个类别的字符区间
+        是已知的；再用分词器的 offset_mapping 把 token 映射到字符区间。
+        """
+
+        encoded = self.processor.tokenizer(
+            prompt,
+            return_offsets_mapping=True,
+            add_special_tokens=True,
+        )
+        offsets = encoded["offset_mapping"]
+
+        if any(offset is None for offset in offsets):
+            raise RuntimeError("分词器未返回 offset_mapping，无法解析类别 token")
+
+        ranges = {}
+        cursor = 0
+        for name in categories:
+            ranges[name] = (cursor, cursor + len(name))
+            cursor += len(name) + 2
+
+        groups = []
+        for name, (start, end) in ranges.items():
+            indices = [
+                index for index, (token_start, token_end) in enumerate(offsets)
+                if token_start < end and token_end > start
+            ]
+            if not indices:
+                raise RuntimeError(f"类别 {name!r} 未匹配到任何 token")
+            groups.append(indices)
+
+        return encoded["input_ids"], groups
+
+    @staticmethod
+    def normalized_to_xyxy(normalized_boxes, image_size):
+        """把归一化的 cxcywh 转成像素 xyxy。"""
+
+        width, height = image_size
+        center_x, center_y, box_width, box_height = normalized_boxes.unbind(-1)
+        return torch.stack(
+            [
+                (center_x - box_width / 2.0) * width,
+                (center_y - box_height / 2.0) * height,
+                (center_x + box_width / 2.0) * width,
+                (center_y + box_height / 2.0) * height,
+            ],
+            dim=-1,
+        )
+
+    def detections_from_phrases(
+        self, outputs, inputs, image, box_threshold, text_threshold
+    ) -> List[Detection]:
+        """原有路径：使用 processor 的短语解码（保留作为回退）。"""
+
+        processed = self.processor.post_process_grounded_object_detection(
+            outputs=outputs,
+            input_ids=inputs["input_ids"],
+            threshold=box_threshold,
+            text_threshold=text_threshold,
+            target_sizes=[image.size[::-1]],
+        )[0]
+
+        return [
+            Detection(
+                label=str(label),
+                score=float(score.item()),
+                box_xyxy=box.detach().cpu().numpy().astype(np.float32),
+            )
+            for box, score, label in zip(
+                processed["boxes"], processed["scores"], processed["labels"]
+            )
+        ]
+
     @torch.inference_mode()
     def predict(
         self,
@@ -52,8 +133,13 @@ class GroundingDinoDetector:
         text_queries: List[str],
         box_threshold: float = 0.25,
         text_threshold: float = 0.20,
+        resolve_labels: bool = True,
     ) -> List[Detection]:
-        """根据文本类别检测图像中的目标。"""
+        """根据文本类别检测图像中的目标。
+
+        resolve_labels=True 时，每个框的标签取"该框在各类别 token 上
+        最大概率"最高的类别，避免出现复合标签。
+        """
 
         if rgb.ndim != 3 or rgb.shape[2] != 3:
             raise ValueError(
@@ -78,34 +164,49 @@ class GroundingDinoDetector:
 
         outputs = self.model(**inputs)
 
-        processed_results = (
-            self.processor.post_process_grounded_object_detection(
-                outputs=outputs,
-                input_ids=inputs["input_ids"],
-                threshold=box_threshold,
-                text_threshold=text_threshold,
-                target_sizes=[image.size[::-1]],
+        if not resolve_labels:
+            return self.detections_from_phrases(
+                outputs, inputs, image, box_threshold, text_threshold
             )
+
+        categories = [query.lower() for query in text_queries]
+        if any("." in query for query in categories):
+            raise ValueError("类别名不能包含句点，否则无法定位 token 区间")
+        prompt = ". ".join(categories) + "."
+
+        prompt_ids, token_groups = self.category_token_groups(prompt, categories)
+        if prompt_ids != inputs["input_ids"][0].tolist():
+            raise RuntimeError(
+                "自行构造的 prompt 与 processor 的 input_ids 不一致，"
+                "无法安全解析类别标签；请改用 resolve_labels=False"
+            )
+
+        probabilities = outputs.logits[0].sigmoid()
+        masked = torch.where(
+            probabilities >= text_threshold,
+            probabilities,
+            torch.zeros_like(probabilities),
         )
 
-        result = processed_results[0]
-        detections = []
+        box_scores = masked.max(dim=-1).values
+        category_scores = torch.stack(
+            [masked[:, indices].max(dim=-1).values for indices in token_groups],
+            dim=-1,
+        )
+        best_score, best_index = category_scores.max(dim=-1)
 
-        for box, score, label in zip(
-            result["boxes"],
-            result["scores"],
-            result["labels"],
-        ):
+        # best_score 为 0 表示没有任何类别 token 通过 text_threshold。
+        keep = (box_scores > box_threshold) & (best_score > 0)
+
+        boxes = self.normalized_to_xyxy(outputs.pred_boxes[0], image.size)
+
+        detections = []
+        for index in torch.nonzero(keep).flatten().tolist():
             detections.append(
                 Detection(
-                    label=str(label),
-                    score=float(score.item()),
-                    box_xyxy=(
-                        box.detach()
-                        .cpu()
-                        .numpy()
-                        .astype(np.float32)
-                    ),
+                    label=text_queries[int(best_index[index])],
+                    score=float(box_scores[index]),
+                    box_xyxy=boxes[index].detach().cpu().numpy().astype(np.float32),
                 )
             )
 
