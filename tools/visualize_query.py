@@ -91,6 +91,16 @@ def main():
 
         scores = {row["global_id"]: row["score"] for row in entry["ranking"]}
         accepted = set(entry["accepted"])
+
+        # 高精度默认阈值（margin>=0.010）下有些查询一个实例都不接受。
+        # 这时退化为只高亮排序第一的实例，并在标题里标明"未达阈值"，
+        # 既不掩盖精度问题，也保证图始终有可看的内容。
+        below_margin = not accepted
+        if below_margin and entry["ranking"]:
+            top = entry["ranking"][0]
+            accepted = {top["global_id"]}
+            scores.setdefault(top["global_id"], top["score"])
+
         # 被接受但不在 top-k 排行里的实例也要有分数，回退到 0。
         for global_id in accepted:
             scores.setdefault(global_id, 0.0)
@@ -148,9 +158,11 @@ def main():
             axes.set_title(title, fontsize=10)
 
         labels = ", ".join("G%03d(%.3f)" % (g, scores[g]) for g in sorted(accepted)) or "none"
+        suffix = "  [top-1 only: below acceptance margin]" if below_margin else ""
         figure.suptitle(
-            "Query \"%s\" -- %d instance(s) accepted: %s" % (query, len(accepted), labels),
-            fontsize=13,
+            "Query \"%s\" -> concept \"%s\" -- %d instance(s)%s\n%s"
+            % (query, entry.get("resolved_concept", "?"), len(accepted), suffix, labels),
+            fontsize=12,
         )
         png_path = output_directory / ("query_%s.png" % slug)
         figure.savefig(png_path, dpi=args.dpi, bbox_inches="tight")

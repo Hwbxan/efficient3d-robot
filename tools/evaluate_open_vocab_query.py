@@ -48,6 +48,28 @@ DEFAULT_TARGETS = {
     "rug": ["rug"],
 }
 
+# GT 类别 → 可接受的概念集合，用于算零样本概念指派精度。
+# 用集合而非单一概念：Replica 同时有 chair 和 sofa 两个类别，而词表里
+# 两者都在，把 sofa 判成 "sofa" 不应算错。集合定义与
+# evaluate_against_gt.py 的 LABEL_SYNONYMS 保持一致的宽松度。
+GT_CLASS_TO_CONCEPTS = {
+    "chair": {"chair", "sofa"},
+    "sofa": {"sofa", "chair"},
+    "table": {"desk"},
+    "desk-organizer": {"desk"},
+    "panel": {"desk"},
+    "bin": {"trash can"},
+    "tissue-paper": {"trash can"},
+    "tv-screen": {"computer monitor"},
+    "tablet": {"computer monitor"},
+    "door": {"door"},
+}
+
+# 单一规范概念，用于"严格"精度
+GT_CLASS_TO_CONCEPT = {
+    gt_class: sorted(concepts)[0] for gt_class, concepts in GT_CLASS_TO_CONCEPTS.items()
+}
+
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -171,12 +193,48 @@ def main():
         fused_vs_gt.append({
             "global_id": global_id,
             "fused_label": entry["fused_label"],
+            "assigned_concept": entry.get("assigned_concept"),
+            "concept_margin": entry.get("concept_margin"),
             "gt_class": gt["gt_class"] if gt else None,
             "gt_object_id": gt["gt_object_id"] if gt else None,
         })
         if gt:
             key = (entry["fused_label"], gt["gt_class"])
             label_agreement[key] = label_agreement.get(key, 0) + 1
+
+    # 零样本概念指派精度：把 GT 类别映射到概念集合后，看 CLIP 的 argmax 对不对。
+    # 这是 Stage 4 语义模块的核心指标，与检索 AP 相互独立。
+    zero_shot = {"correct": 0, "compatible_correct": 0, "total": 0,
+                 "confusion": {}, "rows": []}
+    for entry in fused_vs_gt:
+        gt_class = entry["gt_class"]
+        assigned = entry.get("assigned_concept")
+        if gt_class not in GT_CLASS_TO_CONCEPTS or assigned is None:
+            continue
+        allowed = GT_CLASS_TO_CONCEPTS[gt_class]
+        strict = GT_CLASS_TO_CONCEPT[gt_class] == assigned
+        compatible = assigned in allowed
+        zero_shot["total"] += 1
+        zero_shot["correct"] += int(strict)
+        zero_shot["compatible_correct"] += int(compatible)
+        key = "%s -> %s" % ("|".join(sorted(allowed)), assigned)
+        zero_shot["confusion"][key] = zero_shot["confusion"].get(key, 0) + 1
+        zero_shot["rows"].append({
+            "global_id": entry["global_id"],
+            "gt_class": gt_class,
+            "allowed_concepts": sorted(allowed),
+            "assigned_concept": assigned,
+            "concept_margin": entry.get("concept_margin"),
+            "strict_correct": strict,
+            "compatible": compatible,
+        })
+    zero_shot["accuracy"] = (
+        round(zero_shot["correct"] / zero_shot["total"], 4) if zero_shot["total"] else None
+    )
+    zero_shot["compatible_accuracy"] = (
+        round(zero_shot["compatible_correct"] / zero_shot["total"], 4)
+        if zero_shot["total"] else None
+    )
 
     # 查询词 → 目标 GT 类别
     targets = dict(DEFAULT_TARGETS)
@@ -185,6 +243,9 @@ def main():
             raise SystemExit("--assign 需要 query=class1|class2 形式：%s" % item)
         query, classes = item.split("=", 1)
         targets[query.strip().lower()] = [c.strip() for c in classes.split("|") if c.strip()]
+
+    assignment = {entry["global_id"]: entry
+                  for entry in query_report.get("instance_assignment", [])}
 
     query_metrics = []
     for entry in query_report["queries"]:
@@ -234,9 +295,31 @@ def main():
                 ) if total_relevant else 0.0,
             })
 
+        # 概念指派 margin 扫描：vocabulary 模式下 margin 取多少合适。
+        # 接受条件 = 该实例的 argmax 概念等于查询解析出的概念，且 margin 达标。
+        resolved_concept = entry.get("resolved_concept")
+        margin_sweep = []
+        for margin in (0.0, 0.005, 0.01, 0.015, 0.02, 0.03):
+            accepted = [
+                g for g in ordered
+                if assignment.get(g, {}).get("assigned_concept") == resolved_concept
+                and assignment.get(g, {}).get("concept_margin", 0.0) >= margin
+            ]
+            precision = (
+                sum(1 for g in accepted if relevance[g]) / len(accepted) if accepted else None
+            )
+            margin_sweep.append({
+                "margin": margin,
+                "accepted": len(accepted),
+                "precision": round(precision, 4) if precision is not None else None,
+                "recall": round(sum(1 for g in accepted if relevance[g]) / total_relevant, 4)
+                           if total_relevant else 0.0,
+            })
+
         query_metrics.append({
             "query": query,
             "target_gt_classes": target_classes,
+            "resolved_concept": resolved_concept,
             "ap": round(ap, 4),
             "hits": hits,
             "relevant_total": total_relevant,
@@ -248,6 +331,7 @@ def main():
                 instance_gt.get(g, {}).get("gt_class", "unmatched") for g in entry["accepted"]
             ],
             "acceptance_sweep": sweep,
+            "vocabulary_margin_sweep": margin_sweep,
         })
 
     report = {
@@ -256,6 +340,7 @@ def main():
         "min_overlap_iou": args.min_overlap_iou,
         "instance_gt": {str(k): v for k, v in sorted(instance_gt.items())},
         "fused_vs_gt": fused_vs_gt,
+        "zero_shot_assignment": zero_shot,
         "queries": query_metrics,
     }
     report["instances_without_gt"] = [
@@ -279,17 +364,40 @@ def main():
                 "mean_recall": round(float(np.mean([r["recall"] for r in rows])), 4),
             })
 
+        report["vocabulary_margin_sweep_summary"] = []
+        for index, margin in enumerate((0.0, 0.005, 0.01, 0.015, 0.02, 0.03)):
+            rows = [e["vocabulary_margin_sweep"][index] for e in query_metrics]
+            precisions = [r["precision"] for r in rows if r["precision"] is not None]
+            report["vocabulary_margin_sweep_summary"].append({
+                "margin": margin,
+                "mean_accepted": round(float(np.mean([r["accepted"] for r in rows])), 3),
+                "mean_precision": round(float(np.mean(precisions)), 4) if precisions else None,
+                "mean_recall": round(float(np.mean([r["recall"] for r in rows])), 4),
+            })
+
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     with open(args.output, "w", encoding="utf-8") as handle:
         json.dump(report, handle, ensure_ascii=False, indent=2)
 
     print("\n实例 GT 反推：%d / %d 个实例匹配到 GT 物体"
           % (len(instance_gt), len(fused_vs_gt)))
-    print("\n%-6s %-16s %-16s %s" % ("G-ID", "融合标签", "GT 类别", "GT object"))
+    print("\n%-6s %-14s %-20s %-18s %-6s %s"
+          % ("G-ID", "融合标签", "GT 类别", "指派概念", "严格", "兼容"))
     for entry in fused_vs_gt:
-        print("%-6s %-16s %-16s %s"
+        allowed = GT_CLASS_TO_CONCEPTS.get(entry["gt_class"])
+        assigned = entry.get("assigned_concept") or "-"
+        strict = "-" if allowed is None else ("OK" if GT_CLASS_TO_CONCEPT[entry["gt_class"]] == assigned else "X")
+        compatible = "-" if allowed is None else ("OK" if assigned in allowed else "X")
+        print("%-6s %-14s %-20s %-18s %-6s %s"
               % ("G%03d" % entry["global_id"], entry["fused_label"],
-                 entry["gt_class"] or "-", entry["gt_object_id"] or "-"))
+                 entry["gt_class"] or "-", assigned, strict, compatible))
+
+    print("\n零样本概念指派：严格 %d / %d（%.4f）  兼容 %d / %d（%.4f）"
+          % (zero_shot["correct"], zero_shot["total"], zero_shot["accuracy"] or 0.0,
+             zero_shot["compatible_correct"], zero_shot["total"],
+             zero_shot["compatible_accuracy"] or 0.0))
+    for key, count in sorted(zero_shot["confusion"].items(), key=lambda kv: -kv[1]):
+        print("    %-40s %d" % (key, count))
 
     print("\n开放词汇检索指标")
     print("%-22s %6s %6s %6s %6s %6s %6s" %
@@ -308,6 +416,14 @@ def main():
         for row in report["acceptance_sweep_summary"]:
             print("%8.1f %10.1f %10s %10.3f"
                   % (row["z_threshold"], row["mean_accepted"],
+                     ("%.3f" % row["mean_precision"]) if row["mean_precision"] is not None else "-",
+                     row["mean_recall"]))
+
+        print("\n概念 margin 扫描（vocabulary 模式，跨查询宏平均）")
+        print("%8s %10s %10s %10s" % ("margin", "accepted", "precision", "recall"))
+        for row in report["vocabulary_margin_sweep_summary"]:
+            print("%8.3f %10.1f %10s %10.3f"
+                  % (row["margin"], row["mean_accepted"],
                      ("%.3f" % row["mean_precision"]) if row["mean_precision"] is not None else "-",
                      row["mean_recall"]))
     print("\n输出：%s" % args.output)
