@@ -1,0 +1,277 @@
+from dataclasses import dataclass, field
+
+import numpy as np
+from scipy.optimize import linear_sum_assignment
+
+
+KNOWN_LABELS = {
+    "computer monitor",
+    "chair",
+    "desk",
+    "trash can",
+    "door",
+    "sofa",
+}
+
+
+@dataclass
+class InstanceTrack:
+    """跨帧维护的实例记录。"""
+
+    global_id: int
+    latest_observation: dict
+    first_seen_frame: int
+    last_seen_frame: int
+    observation_count: int = 1
+    label_votes: dict = field(default_factory=dict)
+
+    @property
+    def label(self):
+        if not self.label_votes:
+            return "unknown"
+
+        return max(
+            self.label_votes,
+            key=self.label_votes.get,
+        )
+
+    @property
+    def status(self):
+        if self.observation_count >= 2:
+            return "confirmed"
+
+        return "tentative"
+
+
+def add_label_vote(track, observation):
+    """只有明确类别参与投票，混合标签保留在原始观测中。"""
+
+    label = observation["label"].strip().lower()
+
+    if label in KNOWN_LABELS:
+        track.label_votes[label] = (
+            track.label_votes.get(label, 0) + 1
+        )
+
+
+def geometry_distances(first, second):
+    first_center = np.asarray(first["centroid_world"])
+    second_center = np.asarray(second["centroid_world"])
+
+    center_distance = np.linalg.norm(
+        first_center - second_center
+    )
+
+    first_min = np.asarray(first["bbox_min_world"])
+    first_max = np.asarray(first["bbox_max_world"])
+    second_min = np.asarray(second["bbox_min_world"])
+    second_max = np.asarray(second["bbox_max_world"])
+
+    axis_gaps = np.maximum(
+        np.maximum(
+            first_min - second_max,
+            second_min - first_max,
+        ),
+        0.0,
+    )
+
+    return float(center_distance), float(np.linalg.norm(axis_gaps))
+
+
+class GeometricInstanceTracker:
+    """面向短序列、静态场景的几何关联基线。"""
+
+    def __init__(
+        self,
+        max_center_distance=0.50,
+        max_bbox_gap=0.10,
+        unmatched_cost=0.65,
+        ambiguity_margin=0.08,
+    ):
+        if max_center_distance <= 0 or max_bbox_gap <= 0:
+            raise ValueError("距离门限必须大于 0")
+
+        self.max_center_distance = max_center_distance
+        self.max_bbox_gap = max_bbox_gap
+        self.unmatched_cost = unmatched_cost
+        self.ambiguity_margin = ambiguity_margin
+
+        self.tracks = {}
+        self.next_global_id = 1
+        self.last_processed_frame = None
+
+    def _create_track(self, observation, frame_index):
+        global_id = self.next_global_id
+        self.next_global_id += 1
+
+        track = InstanceTrack(
+            global_id=global_id,
+            latest_observation=observation,
+            first_seen_frame=frame_index,
+            last_seen_frame=frame_index,
+        )
+
+        add_label_vote(track, observation)
+        self.tracks[global_id] = track
+
+        return global_id
+
+    def _association_cost(self, observation, track):
+        center_distance, bbox_gap = geometry_distances(
+            observation,
+            track.latest_observation,
+        )
+
+        if (
+            center_distance > self.max_center_distance
+            or bbox_gap > self.max_bbox_gap
+        ):
+            return np.inf
+
+        observed_label = observation["label"].strip().lower()
+
+        # 不确定标签仅提供较弱的类别证据。
+        if observed_label not in KNOWN_LABELS or track.label == "unknown":
+            label_penalty = 0.5
+        elif observed_label == track.label:
+            label_penalty = 0.0
+        else:
+            label_penalty = 1.0
+
+        return (
+            0.70 * center_distance / self.max_center_distance
+            + 0.20 * bbox_gap / self.max_bbox_gap
+            + 0.10 * label_penalty
+        )
+
+    def update(self, observations, frame_index):
+        """返回当前帧局部 ID 到全局 ID 的关联结果。"""
+
+        if (
+            self.last_processed_frame is not None
+            and frame_index <= self.last_processed_frame
+        ):
+            raise ValueError("必须按严格递增的帧编号更新")
+
+        self.last_processed_frame = frame_index
+
+        if not observations:
+            return []
+
+        # 固定本轮历史实例列表，避免当前帧新建实例参与本轮匹配。
+        previous_tracks = list(self.tracks.values())
+        observation_count = len(observations)
+        track_count = len(previous_tracks)
+
+        pair_costs = np.full(
+            (observation_count, track_count),
+            np.inf,
+        )
+
+        for row, observation in enumerate(observations):
+            for column, track in enumerate(previous_tracks):
+                pair_costs[row, column] = self._association_cost(
+                    observation,
+                    track,
+                )
+
+        # 仅保留比“不匹配”更划算的候选。
+        eligible = pair_costs < self.unmatched_cost
+
+        ambiguous_rows = set()
+
+        for row in range(observation_count):
+            candidate_costs = np.sort(
+                pair_costs[row, eligible[row]]
+            )
+
+            if (
+                len(candidate_costs) >= 2
+                and candidate_costs[1] - candidate_costs[0]
+                < self.ambiguity_margin
+            ):
+                ambiguous_rows.add(row)
+
+        # 右侧每一列都是一个“不匹配”位置。
+        assignment_costs = np.full(
+            (observation_count, track_count + observation_count),
+            self.unmatched_cost,
+        )
+
+        assignment_costs[:, :track_count] = np.where(
+            eligible,
+            pair_costs,
+            1e6,
+        )
+
+        for row in ambiguous_rows:
+            assignment_costs[row, :track_count] = 1e6
+
+        rows, columns = linear_sum_assignment(assignment_costs)
+        assignments = dict(zip(rows.tolist(), columns.tolist()))
+
+        results = []
+
+        for row, observation in enumerate(observations):
+            column = assignments[row]
+
+            result = {
+                "frame_index": frame_index,
+                "local_instance_id": observation["local_instance_id"],
+                "raw_label": observation["label"],
+                "global_id": None,
+                "association_cost": None,
+            }
+
+            if column < track_count:
+                track = previous_tracks[column]
+
+                track.latest_observation = observation
+                track.last_seen_frame = frame_index
+                track.observation_count += 1
+                add_label_vote(track, observation)
+
+                result.update(
+                    global_id=track.global_id,
+                    decision="matched",
+                    association_cost=float(pair_costs[row, column]),
+                )
+
+            elif row in ambiguous_rows:
+                result["decision"] = "deferred_ambiguous"
+
+            elif eligible[row].any():
+                # 合理候选已分配给其他观测。
+                # 暂缓处理，避免立即创建重复实例。
+                result["decision"] = "deferred_conflict"
+
+            else:
+                global_id = self._create_track(
+                    observation,
+                    frame_index,
+                )
+
+                result.update(
+                    global_id=global_id,
+                    decision="new_tentative",
+                )
+
+            results.append(result)
+
+        return results
+
+    def export_tracks(self):
+        return [
+            {
+                "global_id": track.global_id,
+                "label": track.label,
+                "status": track.status,
+                "observation_count": track.observation_count,
+                "first_seen_frame": track.first_seen_frame,
+                "last_seen_frame": track.last_seen_frame,
+                "latest_centroid_world": (
+                    track.latest_observation["centroid_world"]
+                ),
+            }
+            for track in self.tracks.values()
+        ]
