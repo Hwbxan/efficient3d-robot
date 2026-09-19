@@ -53,7 +53,18 @@ LABEL_AGGREGATION = "majority"
 # 它们占着类别槽位会同时干两件坏事：把语义头撑大，以及在 mIoU 里贡献一个
 # "预测成别的语义就扣分、预测成 undefined 才加分"的伪类别。
 # 所以默认把它们映射成无标注（-1），由 losses 的 ignore_index 跳过。
-DEFAULT_EXCLUDED_CLASSES = ["undefined", "anonymize_picture", "anonymize_text"]
+# Replica 里这些"类别"不是物体语义，而是标注流程的占位符：
+#   undefined / anonymize_picture / anonymize_text —— 标注者未能归类 / 隐私模糊区域
+#   non-plane —— 非平面几何，Replica 用它兜住所有不属于任何平面区域的点
+# 它们不是语义，训练它们只会稀释 mIoU。
+# `non-plane` 是实测发现的漏网之鱼：它在验证集里有 16,365 个点，
+# 且 56% 被判成 table —— 一个 IoU 恒为 0 的类别白白占着一个类别槽位。
+DEFAULT_EXCLUDED_CLASSES = [
+    "undefined",
+    "anonymize_picture",
+    "anonymize_text",
+    "non-plane",
+]
 
 
 def parse_arguments():
@@ -73,8 +84,9 @@ def parse_arguments():
     parser.add_argument("--test-scenes", type=int, default=3)
     parser.add_argument("--exclude-classes", nargs="+", default=DEFAULT_EXCLUDED_CLASSES,
                         help="这些类别名**不占类别槽位**，其点被当作无标注（class=-1）。"
-                             "默认剔除 Replica 里的噪声类：undefined（标注者未能归类）、"
-                             "anonymize_picture / anonymize_text（隐私模糊区域）。"
+                             "默认剔除 Replica 里的非语义占位类：undefined（标注者未能归类）、"
+                             "anonymize_picture / anonymize_text（隐私模糊区域）、"
+                             "non-plane（非平面几何兜底类）。"
                              "它们不是语义，训练它们只会稀释 mIoU。传空列表可关闭。")
     parser.add_argument("--dry-run", action="store_true",
                         help="只列出发现的场景与网格大小，不解析面数据")
