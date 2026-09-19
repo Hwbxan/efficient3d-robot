@@ -4,3 +4,4 @@ datasets/
 checkpoints/
 downloads/
 outputs/
+deploy/

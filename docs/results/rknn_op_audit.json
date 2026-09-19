@@ -1,0 +1,217 @@
+{
+  "config": {
+    "num_classes": 87,
+    "num_points": 2048,
+    "level_k": [
+      16,
+      16,
+      12
+    ],
+    "level_channels": [
+      128,
+      256,
+      512
+    ],
+    "downsample_stride": 4,
+    "parameters": 975975,
+    "gemm_parameters": 970215
+  },
+  "onnx_ops": {
+    "Constant": 1037,
+    "Cast": 765,
+    "Reshape": 153,
+    "Slice": 17,
+    "Concat": 154,
+    "Transpose": 25,
+    "Gemm": 16,
+    "LayerNormalization": 13,
+    "Div": 26,
+    "Erf": 13,
+    "Add": 19,
+    "Mul": 50,
+    "aten_amin": 3,
+    "aten_amax": 3,
+    "Sub": 24,
+    "CastLike": 31,
+    "Clip": 16,
+    "Round": 6,
+    "Gather": 15,
+    "Shape": 24,
+    "Expand": 58,
+    "Less": 93,
+    "BitShift": 270,
+    "BitwiseNot": 90,
+    "BitwiseOr": 180,
+    "Where": 93,
+    "BitwiseAnd": 90,
+    "TopK": 12,
+    "Range": 3,
+    "Unsqueeze": 27,
+    "GatherElements": 18,
+    "Pow": 18,
+    "ReduceSum": 24,
+    "MatMul": 9,
+    "Sqrt": 9,
+    "Identity": 8,
+    "ReduceMax": 3,
+    "ArgMax": 3,
+    "ReduceL2": 4,
+    "Reciprocal": 3
+  },
+  "onnx_exporter": "dynamo",
+  "onnx_deploy_path_error": "SymbolicValueError: ONNX export does NOT support exporting bitwise AND for non-boolean input values  [Caused by the value '135 defined in (%135 : Long(1, 2048, strides=[2048, 1], requires_grad=0, device=cpu) = onnx::Div(%127, %134), scope: __main__.TupleOutputWrapper::/src.models.point_encoder.PointEncoder::inner/src.models.point_encoder.SetAbstraction::encoders.0 # /data/efficient3d_robot/src/models/point_encoder.py:151:0",
+  "module_ops": {
+    "Gemm": 16,
+    "LayerNorm": 13,
+    "Gelu": 13,
+    "Dropout": 3
+  },
+  "verdicts": {
+    "Gemm": {
+      "verdict": "NPU",
+      "note": "全连接，需静态形状；BN 应提前融合"
+    },
+    "LayerNorm": {
+      "verdict": "UNKNOWN",
+      "note": "旧版 toolkit 未列出；toolkit2 可能支持。可拆成 ReduceMean+Sub+Pow+ReduceMean+Sqrt+Div"
+    },
+    "Gelu": {
+      "verdict": "UNKNOWN",
+      "note": "未列出；Erf 不支持，需换 tanh 近似或 ReLU/SiLU"
+    },
+    "Dropout": {
+      "verdict": "NPU",
+      "note": "推理态即 Identity"
+    }
+  },
+  "summary": {
+    "NPU": 19,
+    "UNKNOWN": 26
+  },
+  "cpu_side_ops": [],
+  "residual_npu_graph": {
+    "Gemm": 16,
+    "LayerNorm": 13,
+    "Gelu": 13,
+    "Dropout": 3
+  },
+  "residual_summary": {
+    "NPU": 19,
+    "UNKNOWN": 26
+  },
+  "variants": {
+    "full": {
+      "Constant": 1037,
+      "Cast": 765,
+      "Reshape": 153,
+      "Slice": 17,
+      "Concat": 154,
+      "Transpose": 25,
+      "Gemm": 16,
+      "LayerNormalization": 13,
+      "Div": 26,
+      "Erf": 13,
+      "Add": 19,
+      "Mul": 50,
+      "aten_amin": 3,
+      "aten_amax": 3,
+      "Sub": 24,
+      "CastLike": 31,
+      "Clip": 16,
+      "Round": 6,
+      "Gather": 15,
+      "Shape": 24,
+      "Expand": 58,
+      "Less": 93,
+      "BitShift": 270,
+      "BitwiseNot": 90,
+      "BitwiseOr": 180,
+      "Where": 93,
+      "BitwiseAnd": 90,
+      "TopK": 12,
+      "Range": 3,
+      "Unsqueeze": 27,
+      "GatherElements": 18,
+      "Pow": 18,
+      "ReduceSum": 24,
+      "MatMul": 9,
+      "Sqrt": 9,
+      "Identity": 8,
+      "ReduceMax": 3,
+      "ArgMax": 3,
+      "ReduceL2": 4,
+      "Reciprocal": 3
+    },
+    "morton": {
+      "Identity": 18,
+      "Constant": 215,
+      "Slice": 8,
+      "MatMul": 16,
+      "Add": 58,
+      "ReduceMean": 26,
+      "Sub": 28,
+      "Pow": 31,
+      "Sqrt": 13,
+      "Div": 30,
+      "Mul": 63,
+      "Erf": 13,
+      "ConstantOfShape": 18,
+      "Equal": 18,
+      "Where": 18,
+      "Expand": 19,
+      "Unsqueeze": 40,
+      "GatherElements": 15,
+      "ReduceSum": 15,
+      "TopK": 9,
+      "Concat": 12,
+      "Reshape": 24,
+      "ReduceMax": 3,
+      "ReduceL2": 4,
+      "Reciprocal": 3,
+      "Clip": 1,
+      "Shape": 1
+    },
+    "knn": {
+      "Identity": 18,
+      "Constant": 181,
+      "Slice": 1,
+      "MatMul": 16,
+      "Add": 58,
+      "ReduceMean": 26,
+      "Sub": 19,
+      "Pow": 13,
+      "Sqrt": 13,
+      "Div": 30,
+      "Mul": 69,
+      "Erf": 13,
+      "ConstantOfShape": 24,
+      "Equal": 24,
+      "Where": 24,
+      "Expand": 25,
+      "Unsqueeze": 22,
+      "GatherElements": 15,
+      "Reshape": 24,
+      "Concat": 6,
+      "ReduceMax": 3,
+      "ReduceL2": 4,
+      "Reciprocal": 3,
+      "ReduceSum": 6,
+      "Clip": 1,
+      "Shape": 1
+    }
+  },
+  "variant_exporters": {
+    "full": {
+      "exporter": "dynamo",
+      "error": "SymbolicValueError: ONNX export does NOT support exporting bitwise AND for non-boolean input values  [Caused by the value '135 defined in (%135 : Long(1, 2048, strides=[2048, 1], requires_grad=0, device=cpu) = onnx::Div(%127, %134), scope: __main__.TupleOutputWrapper::/src.models.point_encoder.PointEncoder::inner/src.models.point_encoder.SetAbstraction::encoders.0 # /data/efficient3d_robot/src/models/point_encoder.py:151:0"
+    },
+    "morton": {
+      "exporter": "torchscript",
+      "error": null
+    },
+    "knn": {
+      "exporter": "torchscript",
+      "error": null
+    }
+  }
+}

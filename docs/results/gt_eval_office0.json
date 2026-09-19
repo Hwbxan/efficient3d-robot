@@ -1,0 +1,509 @@
+{
+  "tracking_json": "/data/efficient3d_robot/outputs/experiments/office0_filtered_v5_sofa/association/tracking.json",
+  "segmentation_root": "/data/efficient3d_robot/outputs/experiments/office0_filtered_v5_sofa/segmentation",
+  "gt_root": "/data/efficient3d_robot/outputs/gt/office0",
+  "evaluated_frames": 61,
+  "frame_range": [
+    0,
+    600
+  ],
+  "gt_class_filter": [
+    "bin",
+    "chair",
+    "door",
+    "sofa",
+    "table",
+    "tv-screen"
+  ],
+  "min_gt_area": 100,
+  "unassigned_observations": 5,
+  "detection": {
+    "iou_0.25": {
+      "ap": 0.7027,
+      "precision": 0.6681,
+      "recall": 0.8095,
+      "tp": 153,
+      "predictions": 229,
+      "gt_instances": 189
+    },
+    "iou_0.5": {
+      "ap": 0.3142,
+      "precision": 0.524,
+      "recall": 0.6349,
+      "tp": 120,
+      "predictions": 229,
+      "gt_instances": 189
+    }
+  },
+  "min_score": 0.0,
+  "max_area_fraction": 0.4,
+  "score_sweep": {},
+  "area_sweep": {
+    "0.30": {
+      "score_threshold": 0.0,
+      "max_area_fraction": 0.3,
+      "predictions": 206,
+      "detection": {
+        "iou_0.25": {
+          "ap": 0.6846,
+          "precision": 0.6942,
+          "recall": 0.7566,
+          "tp": 143,
+          "predictions": 206,
+          "gt_instances": 189
+        },
+        "iou_0.5": {
+          "ap": 0.293,
+          "precision": 0.534,
+          "recall": 0.582,
+          "tp": 110,
+          "predictions": 206,
+          "gt_instances": 189
+        }
+      },
+      "matched_gt_objects": 9,
+      "single_track_ratio": 0.5556,
+      "label_consistency": {
+        "consistent": 107,
+        "total": 110,
+        "ratio": 0.9727
+      }
+    },
+    "0.40": {
+      "score_threshold": 0.0,
+      "max_area_fraction": 0.4,
+      "predictions": 229,
+      "detection": {
+        "iou_0.25": {
+          "ap": 0.7027,
+          "precision": 0.6681,
+          "recall": 0.8095,
+          "tp": 153,
+          "predictions": 229,
+          "gt_instances": 189
+        },
+        "iou_0.5": {
+          "ap": 0.3142,
+          "precision": 0.524,
+          "recall": 0.6349,
+          "tp": 120,
+          "predictions": 229,
+          "gt_instances": 189
+        }
+      },
+      "matched_gt_objects": 9,
+      "single_track_ratio": 0.5556,
+      "label_consistency": {
+        "consistent": 117,
+        "total": 120,
+        "ratio": 0.975
+      }
+    },
+    "0.50": {
+      "score_threshold": 0.0,
+      "max_area_fraction": 0.5,
+      "predictions": 229,
+      "detection": {
+        "iou_0.25": {
+          "ap": 0.7027,
+          "precision": 0.6681,
+          "recall": 0.8095,
+          "tp": 153,
+          "predictions": 229,
+          "gt_instances": 189
+        },
+        "iou_0.5": {
+          "ap": 0.3142,
+          "precision": 0.524,
+          "recall": 0.6349,
+          "tp": 120,
+          "predictions": 229,
+          "gt_instances": 189
+        }
+      },
+      "matched_gt_objects": 9,
+      "single_track_ratio": 0.5556,
+      "label_consistency": {
+        "consistent": 117,
+        "total": 120,
+        "ratio": 0.975
+      }
+    },
+    "1.00": {
+      "score_threshold": 0.0,
+      "max_area_fraction": 1.0,
+      "predictions": 229,
+      "detection": {
+        "iou_0.25": {
+          "ap": 0.7027,
+          "precision": 0.6681,
+          "recall": 0.8095,
+          "tp": 153,
+          "predictions": 229,
+          "gt_instances": 189
+        },
+        "iou_0.5": {
+          "ap": 0.3142,
+          "precision": 0.524,
+          "recall": 0.6349,
+          "tp": 120,
+          "predictions": 229,
+          "gt_instances": 189
+        }
+      },
+      "matched_gt_objects": 9,
+      "single_track_ratio": 0.5556,
+      "label_consistency": {
+        "consistent": 117,
+        "total": 120,
+        "ratio": 0.975
+      }
+    }
+  },
+  "association": {
+    "iou_threshold": 0.5,
+    "matched_gt_objects": 9,
+    "matched_tracks": 13,
+    "gt_objects_with_single_track": 5,
+    "single_track_ratio": 0.5556,
+    "pure_track_ratio": 1.0,
+    "fragmentation_mean": 1.4444,
+    "fragmented_gt_objects": {
+      "sofa": {
+        "gt_id": 9,
+        "track_ids": [
+          9,
+          21
+        ]
+      },
+      "door": {
+        "gt_id": 16,
+        "track_ids": [
+          3,
+          17
+        ]
+      },
+      "table": {
+        "gt_id": 58,
+        "track_ids": [
+          8,
+          25
+        ]
+      }
+    },
+    "impure_tracks": {}
+  },
+  "label_consistency": {
+    "consistent": 117,
+    "total": 120,
+    "ratio": 0.975
+  },
+  "frames": {
+    "0": {
+      "gt_instances": 10,
+      "predictions": 9,
+      "matched_at_half": 8
+    },
+    "10": {
+      "gt_instances": 10,
+      "predictions": 8,
+      "matched_at_half": 6
+    },
+    "20": {
+      "gt_instances": 10,
+      "predictions": 7,
+      "matched_at_half": 5
+    },
+    "30": {
+      "gt_instances": 10,
+      "predictions": 9,
+      "matched_at_half": 7
+    },
+    "40": {
+      "gt_instances": 10,
+      "predictions": 9,
+      "matched_at_half": 8
+    },
+    "50": {
+      "gt_instances": 10,
+      "predictions": 9,
+      "matched_at_half": 8
+    },
+    "60": {
+      "gt_instances": 10,
+      "predictions": 9,
+      "matched_at_half": 7
+    },
+    "70": {
+      "gt_instances": 9,
+      "predictions": 9,
+      "matched_at_half": 7
+    },
+    "80": {
+      "gt_instances": 8,
+      "predictions": 8,
+      "matched_at_half": 6
+    },
+    "90": {
+      "gt_instances": 7,
+      "predictions": 5,
+      "matched_at_half": 3
+    },
+    "100": {
+      "gt_instances": 5,
+      "predictions": 5,
+      "matched_at_half": 2
+    },
+    "110": {
+      "gt_instances": 5,
+      "predictions": 6,
+      "matched_at_half": 3
+    },
+    "120": {
+      "gt_instances": 6,
+      "predictions": 6,
+      "matched_at_half": 3
+    },
+    "130": {
+      "gt_instances": 6,
+      "predictions": 7,
+      "matched_at_half": 3
+    },
+    "140": {
+      "gt_instances": 5,
+      "predictions": 6,
+      "matched_at_half": 3
+    },
+    "150": {
+      "gt_instances": 5,
+      "predictions": 4,
+      "matched_at_half": 0
+    },
+    "160": {
+      "gt_instances": 2,
+      "predictions": 4,
+      "matched_at_half": 0
+    },
+    "170": {
+      "gt_instances": 2,
+      "predictions": 4,
+      "matched_at_half": 0
+    },
+    "180": {
+      "gt_instances": 2,
+      "predictions": 4,
+      "matched_at_half": 0
+    },
+    "190": {
+      "gt_instances": 2,
+      "predictions": 4,
+      "matched_at_half": 0
+    },
+    "200": {
+      "gt_instances": 2,
+      "predictions": 4,
+      "matched_at_half": 0
+    },
+    "210": {
+      "gt_instances": 2,
+      "predictions": 5,
+      "matched_at_half": 0
+    },
+    "220": {
+      "gt_instances": 2,
+      "predictions": 5,
+      "matched_at_half": 1
+    },
+    "230": {
+      "gt_instances": 2,
+      "predictions": 5,
+      "matched_at_half": 0
+    },
+    "240": {
+      "gt_instances": 1,
+      "predictions": 5,
+      "matched_at_half": 0
+    },
+    "250": {
+      "gt_instances": 1,
+      "predictions": 4,
+      "matched_at_half": 0
+    },
+    "260": {
+      "gt_instances": 1,
+      "predictions": 1,
+      "matched_at_half": 0
+    },
+    "270": {
+      "gt_instances": 0,
+      "predictions": 1,
+      "matched_at_half": 0
+    },
+    "280": {
+      "gt_instances": 0,
+      "predictions": 1,
+      "matched_at_half": 0
+    },
+    "290": {
+      "gt_instances": 0,
+      "predictions": 1,
+      "matched_at_half": 0
+    },
+    "300": {
+      "gt_instances": 1,
+      "predictions": 1,
+      "matched_at_half": 0
+    },
+    "310": {
+      "gt_instances": 1,
+      "predictions": 2,
+      "matched_at_half": 1
+    },
+    "320": {
+      "gt_instances": 1,
+      "predictions": 1,
+      "matched_at_half": 1
+    },
+    "330": {
+      "gt_instances": 1,
+      "predictions": 1,
+      "matched_at_half": 1
+    },
+    "340": {
+      "gt_instances": 1,
+      "predictions": 2,
+      "matched_at_half": 1
+    },
+    "350": {
+      "gt_instances": 1,
+      "predictions": 1,
+      "matched_at_half": 1
+    },
+    "360": {
+      "gt_instances": 2,
+      "predictions": 3,
+      "matched_at_half": 2
+    },
+    "370": {
+      "gt_instances": 2,
+      "predictions": 3,
+      "matched_at_half": 2
+    },
+    "380": {
+      "gt_instances": 2,
+      "predictions": 3,
+      "matched_at_half": 2
+    },
+    "390": {
+      "gt_instances": 3,
+      "predictions": 3,
+      "matched_at_half": 2
+    },
+    "400": {
+      "gt_instances": 3,
+      "predictions": 3,
+      "matched_at_half": 2
+    },
+    "410": {
+      "gt_instances": 2,
+      "predictions": 4,
+      "matched_at_half": 2
+    },
+    "420": {
+      "gt_instances": 2,
+      "predictions": 4,
+      "matched_at_half": 2
+    },
+    "430": {
+      "gt_instances": 2,
+      "predictions": 4,
+      "matched_at_half": 2
+    },
+    "440": {
+      "gt_instances": 2,
+      "predictions": 4,
+      "matched_at_half": 2
+    },
+    "450": {
+      "gt_instances": 2,
+      "predictions": 4,
+      "matched_at_half": 2
+    },
+    "460": {
+      "gt_instances": 1,
+      "predictions": 2,
+      "matched_at_half": 1
+    },
+    "470": {
+      "gt_instances": 1,
+      "predictions": 2,
+      "matched_at_half": 1
+    },
+    "480": {
+      "gt_instances": 1,
+      "predictions": 2,
+      "matched_at_half": 1
+    },
+    "490": {
+      "gt_instances": 1,
+      "predictions": 2,
+      "matched_at_half": 1
+    },
+    "500": {
+      "gt_instances": 1,
+      "predictions": 2,
+      "matched_at_half": 1
+    },
+    "510": {
+      "gt_instances": 1,
+      "predictions": 1,
+      "matched_at_half": 1
+    },
+    "520": {
+      "gt_instances": 1,
+      "predictions": 1,
+      "matched_at_half": 1
+    },
+    "530": {
+      "gt_instances": 2,
+      "predictions": 3,
+      "matched_at_half": 1
+    },
+    "540": {
+      "gt_instances": 1,
+      "predictions": 1,
+      "matched_at_half": 1
+    },
+    "550": {
+      "gt_instances": 1,
+      "predictions": 1,
+      "matched_at_half": 1
+    },
+    "560": {
+      "gt_instances": 1,
+      "predictions": 1,
+      "matched_at_half": 1
+    },
+    "570": {
+      "gt_instances": 1,
+      "predictions": 1,
+      "matched_at_half": 1
+    },
+    "580": {
+      "gt_instances": 1,
+      "predictions": 1,
+      "matched_at_half": 1
+    },
+    "590": {
+      "gt_instances": 1,
+      "predictions": 1,
+      "matched_at_half": 1
+    },
+    "600": {
+      "gt_instances": 1,
+      "predictions": 1,
+      "matched_at_half": 1
+    }
+  },
+  "note": "AP 为类别无关的帧级实例检测精度；关联指标在 association.iou_threshold 下统计。"
+}

@@ -1,0 +1,28 @@
+# 开发环境实测版本见行尾注释（torch 2.5.1+cu121 / CUDA 12.1，Ubuntu 22.04）
+#
+# 安装 PyTorch 建议按官方命令选 CUDA 版本，不要直接 pip install torch：
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+
+# ---- 核心数值与深度学习 ----
+torch>=2.1                  # 实测 2.5.1+cu121
+torchvision>=0.16           # transformers 的检测/分割模型需要
+numpy>=1.24                 # 实测 2.5.2
+scipy>=1.10
+
+# ---- 2D 开放词汇检测与分割（Grounding DINO + SAM 2）----
+transformers>=4.40          # 实测 5.16.1
+Pillow>=10.0
+
+# ---- 3D 处理与可视化 ----
+open3d>=0.18                # 实测 0.19.0
+matplotlib>=3.7             # 实测 3.11.0
+opencv-python>=4.8          # 实测 5.0.0
+
+# ---- 部署路径：ONNX 导出与 RKNN 算子审计 ----
+# onnxscript 是 torch.export（dynamo）导出器的依赖；
+# 只有 rknn_op_audit 在「部署路径导不出来」时才会用到它，但缺了会直接报错。
+onnx>=1.15                  # 实测 1.22.0
+onnxscript>=0.1             # 实测 0.7.2
+
+# 说明：RK3588 上真正跑的是 rknn-toolkit2，它只装在有 NPU 的机器上，
+# 不属于本仓库的依赖 —— 本仓库只负责产出可被它吃下的 ONNX。

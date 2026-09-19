@@ -1,0 +1,125 @@
+{
+  "checkpoint": null,
+  "num_points": 2048,
+  "num_classes": 87,
+  "replaced_modules": {
+    "RKNNFriendlyLayerNorm": 13,
+    "RKNNFriendlyGELU": 13,
+    "RKNNFriendlyInverseDistanceWeight": 3,
+    "RKNNFriendlyL2Normalise": 1
+  },
+  "equivalence": {
+    "tolerance": 0.001,
+    "argmax_tolerance": 0.99,
+    "per_output": {
+      "semantic_logits": {
+        "max_abs_diff": 0.0008060932159423828,
+        "max_rel_diff": 0.0005507196765393019,
+        "mean_abs_diff": 0.00014758241013623774,
+        "cosine_min": 0.9999996423721313,
+        "ok": true
+      },
+      "instance_embedding": {
+        "max_abs_diff": 0.0008136630058288574,
+        "max_rel_diff": 0.0006545217474922538,
+        "mean_abs_diff": 0.00016269262414425611,
+        "cosine_min": 0.999999463558197,
+        "ok": true
+      },
+      "text_embedding": {
+        "max_abs_diff": 0.00010579125955700874,
+        "max_rel_diff": 0.0005244793719612062,
+        "mean_abs_diff": 1.497822995588649e-05,
+        "cosine_min": 0.9999997019767761,
+        "ok": true
+      }
+    },
+    "ok": true,
+    "semantic_argmax_agreement": 0.99951171875,
+    "argmax_ok": true
+  },
+  "onnx_full": {
+    "path": "/tmp/pe_rknn_dynamo.onnx",
+    "size_mb": 4.96,
+    "total_nodes": 3607,
+    "op_count": 38,
+    "ops": {
+      "Constant": 1041,
+      "Cast": 765,
+      "BitShift": 270,
+      "BitwiseOr": 180,
+      "Reshape": 175,
+      "Concat": 153,
+      "Mul": 143,
+      "Less": 93,
+      "Where": 93,
+      "BitwiseNot": 90,
+      "BitwiseAnd": 90,
+      "Add": 58,
+      "Expand": 57,
+      "Sub": 37,
+      "Pow": 35,
+      "CastLike": 31,
+      "ReduceSum": 28,
+      "Unsqueeze": 27,
+      "ReduceMean": 26,
+      "Transpose": 25,
+      "Shape": 24,
+      "GatherElements": 18,
+      "Slice": 17,
+      "Gemm": 16,
+      "Clip": 16,
+      "Gather": 15,
+      "Tanh": 13,
+      "Div": 12,
+      "TopK": 12,
+      "MatMul": 9,
+      "Sqrt": 9,
+      "Identity": 8,
+      "Round": 6,
+      "aten_amin": 3,
+      "aten_amax": 3,
+      "Range": 3,
+      "ReduceMax": 3,
+      "ArgMax": 3
+    },
+    "forbidden_present": {
+      "Sqrt": 9
+    },
+    "clean": false
+  },
+  "onnx_full_exporter": "dynamo",
+  "onnx_deployable": {
+    "path": "/tmp/pe_rknn_deploy.onnx",
+    "size_mb": 4.0,
+    "total_nodes": 705,
+    "op_count": 22,
+    "ops": {
+      "Constant": 195,
+      "Mul": 149,
+      "Add": 71,
+      "ReduceMean": 26,
+      "ConstantOfShape": 24,
+      "Equal": 24,
+      "Where": 24,
+      "Expand": 24,
+      "Reshape": 24,
+      "Unsqueeze": 22,
+      "Sub": 19,
+      "Identity": 18,
+      "Pow": 17,
+      "MatMul": 16,
+      "GatherElements": 15,
+      "Tanh": 13,
+      "ReduceSum": 10,
+      "Concat": 6,
+      "ReduceMax": 3,
+      "Div": 3,
+      "Slice": 1,
+      "Clip": 1
+    },
+    "forbidden_present": {},
+    "clean": true
+  },
+  "onnx_deployable_exporter": "torchscript"
+}
