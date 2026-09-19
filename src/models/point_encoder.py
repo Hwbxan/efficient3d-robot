@@ -38,6 +38,70 @@ import torch.nn.functional as F
 
 
 # --------------------------------------------------------------------------- #
+# 可替换的基础模块
+# --------------------------------------------------------------------------- #
+#
+# 这些模块独立出来，是为了让**部署路径**能把它们换成 RKNN 友好的等价实现，
+# 而不改动训练路径。默认行为与原来的函数式写法逐位一致。
+#
+# 动机（见 `RKNN算子审计报告_2026-09-19.md`）：
+#   - `nn.GELU()` 的精确实现导出成 ONNX 是 `Erf`，RKNN 不支持；
+#     换成 `approximate="tanh"` 后变成 `Tanh`，在支持列表里。
+#   - `F.normalize` / `nn.LayerNorm` 会引入 `Sqrt`（或 `ReduceL2`），
+#     而 RK3588 NPU 没有 sqrt 硬件加速；用 `Pow(·, -0.5)` 可以完全规避。
+
+
+class L2Normalise(nn.Module):
+    """L2 归一化。与 `F.normalize(x, dim=dim, eps=eps)` 逐位一致。
+
+    独立成模块是为了让部署路径能替换掉它（避免 `ReduceL2` / `Sqrt`）。
+    """
+
+    def __init__(self, dim: int = -1, eps: float = 1e-12):
+        super().__init__()
+        self.dim = dim
+        self.eps = eps
+
+    def forward(self, x):
+        return F.normalize(x, dim=self.dim, eps=self.eps)
+
+    def extra_repr(self) -> str:
+        return f"dim={self.dim}, eps={self.eps}"
+
+
+def make_activation(name: str = "gelu") -> nn.Module:
+    """按名字构造激活。`gelu` 是默认（训练用），`gelu_tanh` 是部署用近似。"""
+
+    if name == "gelu":
+        return nn.GELU()
+    if name == "gelu_tanh":
+        return nn.GELU(approximate="tanh")
+    if name == "relu":
+        return nn.ReLU()
+    raise ValueError(f"未知激活：{name!r}（可选 gelu / gelu_tanh / relu）")
+
+
+class InverseDistanceWeight(nn.Module):
+    """反距离加权：给 k 个邻居按 `1/(d + eps)` 加权后归一化。
+
+    独立成模块是为了让部署路径能换成只含 `Pow` 的等价实现 ——
+    `.norm()` 会引入 `ReduceL2` / `Sqrt`，而 RK3588 NPU 没有 sqrt 硬件加速。
+    """
+
+    def __init__(self, eps: float = 1e-8):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, neighbour_xyz, query_xyz):
+        distance = (neighbour_xyz - query_xyz.unsqueeze(2)).norm(dim=-1)
+        weight = 1.0 / (distance + self.eps)
+        return weight / weight.sum(dim=-1, keepdim=True)
+
+    def extra_repr(self) -> str:
+        return f"eps={self.eps}"
+
+
+# --------------------------------------------------------------------------- #
 # 邻域搜索 / 采样工具：全部纯 PyTorch，无第三方扩展依赖
 # --------------------------------------------------------------------------- #
 
@@ -129,6 +193,7 @@ class PointEncoderConfig:
     instance_dim: int = 16
     text_dim: int = 512
     dropout: float = 0.0
+    activation: str = "gelu"             # gelu（训练）/ gelu_tanh（部署近似）
 
     def __post_init__(self):
         if len(self.level_channels) != len(self.level_k):
@@ -145,17 +210,17 @@ class PointEncoderConfig:
 class SetAbstraction(nn.Module):
     """降采样 + kNN 邻域聚合（PointNet++ SA，两层 MLP + max pool）。"""
 
-    def __init__(self, in_channels, out_channels, k, stride):
+    def __init__(self, in_channels, out_channels, k, stride, activation="gelu"):
         super().__init__()
         self.k = k
         self.stride = stride
         self.mlp = nn.Sequential(
             nn.Linear(in_channels + 3, out_channels),             # +3 是相对坐标
             nn.LayerNorm(out_channels),
-            nn.GELU(),
+            make_activation(activation),
             nn.Linear(out_channels, out_channels),
             nn.LayerNorm(out_channels),
-            nn.GELU(),
+            make_activation(activation),
         )
 
     def forward(self, xyz, features):
@@ -176,17 +241,19 @@ class SetAbstraction(nn.Module):
 class FeaturePropagation(nn.Module):
     """上采样 + skip 融合（PointNet++ FP，3-NN 反距离插值）。"""
 
-    def __init__(self, coarse_channels, skip_channels, out_channels, k=3, dropout=0.0):
+    def __init__(self, coarse_channels, skip_channels, out_channels, k=3, dropout=0.0,
+                 activation="gelu"):
         super().__init__()
         self.k = k
+        self.weighting = InverseDistanceWeight()
         self.mlp = nn.Sequential(
             nn.Linear(coarse_channels + skip_channels, out_channels),
             nn.LayerNorm(out_channels),
-            nn.GELU(),
+            make_activation(activation),
             nn.Dropout(dropout) if dropout > 0 else nn.Identity(),
             nn.Linear(out_channels, out_channels),
             nn.LayerNorm(out_channels),
-            nn.GELU(),
+            make_activation(activation),
         )
 
     def forward(self, xyz_coarse, feat_coarse, xyz_fine, feat_skip):
@@ -194,9 +261,7 @@ class FeaturePropagation(nn.Module):
         neighbour_xyz = gather_features(xyz_coarse, neighbours)
         neighbour_feat = gather_features(feat_coarse, neighbours)
 
-        distance = (neighbour_xyz - xyz_fine.unsqueeze(2)).norm(dim=-1)
-        weight = 1.0 / (distance + 1e-8)
-        weight = weight / weight.sum(dim=-1, keepdim=True)
+        weight = self.weighting(neighbour_xyz, xyz_fine)           # (B, Q, k)
         interpolated = (neighbour_feat * weight.unsqueeze(-1)).sum(dim=2)
 
         return self.mlp(torch.cat([interpolated, feat_skip], dim=-1))
@@ -221,14 +286,15 @@ class PointEncoder(nn.Module):
         self.stem = nn.Sequential(
             nn.Linear(cfg.in_channels, cfg.stem_channels),
             nn.LayerNorm(cfg.stem_channels),
-            nn.GELU(),
+            make_activation(cfg.activation),
         )
 
         self.encoders = nn.ModuleList()
         in_channels = cfg.stem_channels
         for out_channels, k in zip(cfg.level_channels, cfg.level_k):
             self.encoders.append(
-                SetAbstraction(in_channels, out_channels, k, cfg.downsample_stride)
+                SetAbstraction(in_channels, out_channels, k, cfg.downsample_stride,
+                               activation=cfg.activation)
             )
             in_channels = out_channels
 
@@ -244,7 +310,8 @@ class PointEncoder(nn.Module):
             )
             out_channels = cfg.decoder_channels[step]
             self.decoders.append(
-                FeaturePropagation(coarse_channels, skip_channels, out_channels, dropout=cfg.dropout)
+                FeaturePropagation(coarse_channels, skip_channels, out_channels,
+                                   dropout=cfg.dropout, activation=cfg.activation)
             )
             coarse_channels = out_channels
 
@@ -252,6 +319,7 @@ class PointEncoder(nn.Module):
         self.semantic_head = nn.Linear(final_channels, cfg.num_classes)
         self.instance_head = nn.Linear(final_channels, cfg.instance_dim)
         self.text_head = nn.Linear(final_channels, cfg.text_dim)
+        self.text_normalise = L2Normalise(dim=-1)
 
     def forward(self, features, xyz=None):
         """features: `(B, P, in_channels)`，前 3 通道视为 xyz。"""
@@ -284,7 +352,7 @@ class PointEncoder(nn.Module):
         return PointEncoderOutput(
             semantic_logits=self.semantic_head(decoded),
             instance_embedding=self.instance_head(decoded),
-            text_embedding=F.normalize(self.text_head(decoded), dim=-1),
+            text_embedding=self.text_normalise(self.text_head(decoded)),
             point_features=decoded,
         )
 
