@@ -46,6 +46,15 @@ import numpy as np
 # 体素下采样时，标签用多数投票而不是平均——平均会把类别索引搅成无意义的中间值。
 LABEL_AGGREGATION = "majority"
 
+# Replica 的 info_semantic.json 里这几类不是语义，而是"标注缺口"或隐私模糊区域：
+#   undefined           —— 标注者没能归类（18 个场景里全都出现）
+#   anonymize_picture   —— 人脸/照片模糊块
+#   anonymize_text      —— 文字模糊块
+# 它们占着类别槽位会同时干两件坏事：把语义头撑大，以及在 mIoU 里贡献一个
+# "预测成别的语义就扣分、预测成 undefined 才加分"的伪类别。
+# 所以默认把它们映射成无标注（-1），由 losses 的 ignore_index 跳过。
+DEFAULT_EXCLUDED_CLASSES = ["undefined", "anonymize_picture", "anonymize_text"]
+
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -62,6 +71,11 @@ def parse_arguments():
                         help="只处理前 N 个场景，用于快速验证流程")
     parser.add_argument("--val-scenes", type=int, default=3)
     parser.add_argument("--test-scenes", type=int, default=3)
+    parser.add_argument("--exclude-classes", nargs="+", default=DEFAULT_EXCLUDED_CLASSES,
+                        help="这些类别名**不占类别槽位**，其点被当作无标注（class=-1）。"
+                             "默认剔除 Replica 里的噪声类：undefined（标注者未能归类）、"
+                             "anonymize_picture / anonymize_text（隐私模糊区域）。"
+                             "它们不是语义，训练它们只会稀释 mIoU。传空列表可关闭。")
     parser.add_argument("--dry-run", action="store_true",
                         help="只列出发现的场景与网格大小，不解析面数据")
     parser.add_argument("--seed", type=int, default=0)
@@ -351,13 +365,18 @@ def load_class_names(info_path):
     return id_to_name, names
 
 
-def build_global_class_table(scene_infos):
-    """所有场景类别名的并集，排序后作为全局类别表。"""
+def build_global_class_table(scene_infos, exclude=()):
+    """所有场景类别名的并集，排序后作为全局类别表。
 
+    `exclude` 里的名字**不进入类别表**，所以不占类别槽位；
+    对应的物体在 `process_scene` 里会被留成无标注（-1）。
+    """
+
+    excluded = set(exclude)
     names = set()
     for id_to_name, _ in scene_infos:
         names |= set(id_to_name.values())
-    return sorted(names)
+    return sorted(names - excluded)
 
 
 def process_scene(scene, mesh_path, id_to_name, class_index, args):
@@ -377,8 +396,15 @@ def process_scene(scene, mesh_path, id_to_name, class_index, args):
 
     unknown = sorted(set(instance.tolist()) - set(id_to_name.keys()))
     class_id = np.full(vertex_count, -1, dtype=np.int32)
+    excluded_objects = 0
     for object_id, name in id_to_name.items():
-        class_id[instance == object_id] = class_index[name]
+        index = class_index.get(name)
+        if index is None:
+            # 被 --exclude-classes 剔掉的噪声类别：保持 -1（无标注），
+            # 既不给它类别槽位，也不让它把周围点"投票"成伪类别。
+            excluded_objects += 1
+            continue
+        class_id[instance == object_id] = index
 
     total_before = vertex_count
     voxel_count = None
@@ -423,6 +449,7 @@ def process_scene(scene, mesh_path, id_to_name, class_index, args):
         "instances_kept": len(kept_instances),
         "classes_kept": len(kept_classes),
         "unlabelled_points": int((class_id < 0).sum()),
+        "excluded_objects": excluded_objects,
         "unknown_object_ids": unknown[:20],
         "class_histogram": histogram,
         "seconds": {
@@ -462,9 +489,11 @@ def main():
             raise SystemExit(f"{scene} 缺少 info_semantic.json，无法得到类别名")
         scene_infos.append(load_class_names(info_path))
 
-    class_names = build_global_class_table(scene_infos)
+    class_names = build_global_class_table(scene_infos, args.exclude_classes)
     class_index = {name: index for index, name in enumerate(class_names)}
     print(f"全局类别表：{len(class_names)} 类")
+    if args.exclude_classes:
+        print(f"已剔除的噪声类别（其点记为无标注）：{list(args.exclude_classes)}")
 
     output_directory = Path(args.output_directory)
     scene_directory = output_directory / "scenes"
@@ -514,6 +543,7 @@ def main():
         "label_aggregation": LABEL_AGGREGATION,
         "class_names": class_names,
         "num_classes": len(class_names),
+        "excluded_classes": list(args.exclude_classes),
         "splits": splits,
         "total_points": int(sum(stats["points"] for stats in all_stats)),
         "total_instances_kept": int(sum(stats["instances_kept"] for stats in all_stats)),
@@ -521,7 +551,8 @@ def main():
         "scenes": all_stats,
         "note": (
             "逐点标签来自网格面级 object_id（顶点用相邻面多数投票）；"
-            "class = -1 表示该 object_id 不在 info_semantic.json 里。"
+            "class = -1 表示该 object_id 不在 info_semantic.json 里，"
+            "或属于 excluded_classes 里被剔除的噪声类别。"
             "划分是场景级的，避免同房间泄漏。"
         ),
     }
