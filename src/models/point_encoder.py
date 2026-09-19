@@ -320,9 +320,34 @@ def parameter_count(model):
 # 而不是由它恰好落在尾部的那个块处理（尾部的点邻域信息最少）。
 
 
+def normalise_block(features):
+    """按**训练时的口径**归一化一块点云。
+
+    `PointCloudPatchDataset._normalise` 对每个训练块做两件事：
+    xyz 平移到质心后按最大半径缩放到单位球，normal 单位化。
+    推理时**必须做完全相同的变换**，否则模型看到的坐标尺度差了"房间大小 / 单位球"
+    这个量级（训练时最大半径恒为 1，直接喂世界坐标则是几米），
+    第一层 MLP 与 SA 里的相对坐标 `neighbour - centre` 全部落在训练分布之外，
+    表现为整场景评测比按块评测差一大截（实测宏平均 0.158 → 0.066）。
+    """
+
+    xyz = features[:, :3]
+    xyz = xyz - xyz.mean(dim=0, keepdim=True)
+    scale = xyz.norm(dim=1).max()
+    if float(scale) > 1e-6:
+        xyz = xyz / scale
+
+    features = features.clone()
+    features[:, :3] = xyz
+    if features.shape[1] >= 6:
+        normal = features[:, 3:6]
+        features[:, 3:6] = normal / normal.norm(dim=1, keepdim=True).clamp(min=1e-6)
+    return features
+
+
 @torch.no_grad()
 def encode_cloud_in_blocks(model, features, num_points=8192, overlap=0.1,
-                           device=None, batch_size=1):
+                           device=None, batch_size=1, normalize=True):
     """整场景分块推理。
 
     `features`: `(N, C)` 或 `(1, N, C)` 的 tensor/ndarray，前 3 通道是 xyz。
@@ -359,7 +384,10 @@ def encode_cloud_in_blocks(model, features, num_points=8192, overlap=0.1,
         block = order[start:start + num_points]
         if block.numel() == 0:
             break
-        output = model(features[block].unsqueeze(0))
+        block_features = features[block]
+        if normalize:
+            block_features = normalise_block(block_features)
+        output = model(block_features.unsqueeze(0))
         pending = ~filled[block]
         if not pending.any():
             continue

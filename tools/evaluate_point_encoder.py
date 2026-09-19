@@ -161,6 +161,25 @@ def nearest_centroid_purity(embedding, instance, ignore_instance=0):
     }
 
 
+def pairwise_squared_distance(block, reference):
+    """`(B, C)` 对 `(N, C)` 的逐对平方距离，返回 `(B, N)`。
+
+    **不要写 `((block[:, None, :] - reference[None, :, :]) ** 2).sum(-1)`**：
+    中间张量是 `(B, N, C)`。B=1024、N=50000、C=16 时就是 3.3 GB，
+    31 GiB 的机器上会和别的任务一起把内存吃光，表现为"CPU 跑满但半天不出结果"。
+    用展开式 `|a|² - 2a·b + |b|²` 只留 `(B, N)` 的中间量（164 MB），
+    而且点积走 BLAS，快得多。
+    """
+
+    distance = (
+        (block ** 2).sum(axis=1)[:, None]
+        - 2.0 * block @ reference.T
+        + (reference ** 2).sum(axis=1)[None, :]
+    )
+    # 展开式在 a≈b 时会因浮点误差出现极小的负数，开方前夹到 0
+    return np.maximum(distance, 0.0)
+
+
 def knn_graph_clusters(embedding, k=8, threshold=1.0, chunk=1024):
     """在嵌入的 kNN 图上按距离阈值取连通分量（无 GT、可部署）。
 
@@ -182,7 +201,7 @@ def knn_graph_clusters(embedding, k=8, threshold=1.0, chunk=1024):
 
     for start in range(0, total, chunk):
         block = embedding[start:start + chunk]
-        distance = ((block[:, None, :] - embedding[None, :, :]) ** 2).sum(axis=-1)
+        distance = pairwise_squared_distance(block, embedding)
         if k:
             neighbours = np.argpartition(distance, k, axis=1)[:, :k + 1]
         else:
