@@ -80,6 +80,13 @@ def parse_arguments():
     )
 
     parser.add_argument(
+        "--max-box-area-fraction",
+        type=float,
+        default=0.40,
+        help="丢弃面积占比超过该值的检测框（针对 Grounding DINO 的背景块误检）；1.0 关闭",
+    )
+
+    parser.add_argument(
         "--output-directory",
         type=Path,
         default=Path("outputs/perception/grounded_sam2"),
@@ -206,6 +213,7 @@ def main():
         text_queries=arguments.classes,
         box_threshold=arguments.box_threshold,
         text_threshold=arguments.text_threshold,
+        max_box_area_fraction=arguments.max_box_area_fraction,
     )
 
     detection_time_ms = (

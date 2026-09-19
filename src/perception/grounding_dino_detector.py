@@ -103,7 +103,8 @@ class GroundingDinoDetector:
         )
 
     def detections_from_phrases(
-        self, outputs, inputs, image, box_threshold, text_threshold
+        self, outputs, inputs, image, box_threshold, text_threshold,
+        max_box_area_fraction=1.0,
     ) -> List[Detection]:
         """原有路径：使用 processor 的短语解码（保留作为回退）。"""
 
@@ -115,7 +116,7 @@ class GroundingDinoDetector:
             target_sizes=[image.size[::-1]],
         )[0]
 
-        return [
+        detections = [
             Detection(
                 label=str(label),
                 score=float(score.item()),
@@ -126,6 +127,17 @@ class GroundingDinoDetector:
             )
         ]
 
+        if max_box_area_fraction < 1.0:
+            image_area = float(image.size[0] * image.size[1])
+            detections = [
+                detection for detection in detections
+                if (
+                    (detection.box_xyxy[2] - detection.box_xyxy[0])
+                    * (detection.box_xyxy[3] - detection.box_xyxy[1])
+                ) / image_area <= max_box_area_fraction
+            ]
+        return detections
+
     @torch.inference_mode()
     def predict(
         self,
@@ -134,11 +146,23 @@ class GroundingDinoDetector:
         box_threshold: float = 0.25,
         text_threshold: float = 0.20,
         resolve_labels: bool = True,
+        max_box_area_fraction: float = 0.40,
     ) -> List[Detection]:
         """根据文本类别检测图像中的目标。
 
         resolve_labels=True 时，每个框的标签取"该框在各类别 token 上
         最大概率"最高的类别，避免出现复合标签。
+
+        max_box_area_fraction 用于剔除"背景块"误检：Grounding DINO 对
+        短类别词（desk / door / computer monitor）会给出覆盖半张图的大框，
+        且分数不低（0.36~0.78）、类别间间隔也不小，靠分数阈值分不掉
+        ——实测提高分数阈值反而单调降低 AP。
+
+        在 Replica office0 上（61 帧、209 个 GT 实例）实测：
+        阈值 0.50 丢 8 个 FP、0 个 TP；0.40 丢 26 个 FP、0 个 TP
+        （AP@0.25 0.5821->0.6252，AP@0.50 0.2581->0.2843，召回不变）；
+        0.30 起开始丢 TP（6 个）。故 0.40 是"零召回代价"的最大过滤强度。
+        设为 1.0 关闭该过滤。
         """
 
         if rgb.ndim != 3 or rgb.shape[2] != 3:
@@ -166,7 +190,8 @@ class GroundingDinoDetector:
 
         if not resolve_labels:
             return self.detections_from_phrases(
-                outputs, inputs, image, box_threshold, text_threshold
+                outputs, inputs, image, box_threshold, text_threshold,
+                max_box_area_fraction,
             )
 
         categories = [query.lower() for query in text_queries]
@@ -199,6 +224,13 @@ class GroundingDinoDetector:
         keep = (box_scores > box_threshold) & (best_score > 0)
 
         boxes = self.normalized_to_xyxy(outputs.pred_boxes[0], image.size)
+
+        if max_box_area_fraction < 1.0:
+            image_area = float(image.size[0] * image.size[1])
+            box_width = (boxes[:, 2] - boxes[:, 0]).clamp(min=0.0)
+            box_height = (boxes[:, 3] - boxes[:, 1]).clamp(min=0.0)
+            area_fraction = (box_width * box_height) / image_area
+            keep = keep & (area_fraction <= max_box_area_fraction)
 
         detections = []
         for index in torch.nonzero(keep).flatten().tolist():

@@ -124,6 +124,7 @@ def prepare_frame(args, frame, run_directory):
                 "--scene-directory", args.scene_directory, "--frame-index", frame,
                 "--dino-model", args.dino_model, "--sam-model", args.sam_model,
                 "--box-threshold", args.box_threshold, "--text-threshold", args.text_threshold,
+                "--max-box-area-fraction", args.max_box_area_fraction,
                 "--output-directory", segmentation, "--classes", *args.classes,
             ], run_directory / "logs" / f"{name}_segmentation.log")
             source = "new_inference"
@@ -219,6 +220,10 @@ def main():
     parser.add_argument("--classes", nargs="+", default=["computer monitor", "chair", "desk", "trash can", "door"])
     parser.add_argument("--box-threshold", type=float, default=0.30)
     parser.add_argument("--text-threshold", type=float, default=0.20)
+    parser.add_argument(
+        "--max-box-area-fraction", type=float, default=0.40,
+        help="丢弃面积占比超过该值的检测框（针对背景块误检）；1.0 关闭",
+    )
     parser.add_argument("--pixel-stride", type=int, default=2)
     parser.add_argument("--erosion-iterations", type=int, default=1)
     parser.add_argument("--voxel-size", type=float, default=0.02)

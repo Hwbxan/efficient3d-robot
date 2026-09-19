@@ -54,6 +54,16 @@ def parse_arguments():
         default=None,
         help="逗号分隔的 GT 类别白名单；只评测这些类别（默认全部，含墙/地板等结构性物体）",
     )
+    parser.add_argument("--min-score", type=float, default=0.0,
+                        help="主评测使用的检测分数下限")
+    parser.add_argument("--score-sweep", type=float, nargs="+", default=None,
+                        help="额外的检测分数阈值，逐个重算指标以观察阈值影响")
+    parser.add_argument("--max-area-fraction", type=float, default=1.0,
+                        help="主评测丢弃框面积占比超过该值的检测（针对背景块误检）")
+    parser.add_argument("--area-sweep", type=float, nargs="+", default=None,
+                        help="额外的框面积占比上限，逐个重算指标")
+    parser.add_argument("--image-width", type=int, default=1200)
+    parser.add_argument("--image-height", type=int, default=680)
     return parser.parse_args()
 
 
@@ -71,8 +81,15 @@ def load_tracking(path):
     return frames
 
 
-def load_predictions(frame_index, segmentation_root, local_to_global):
-    """合并同 global_id 的检测掩码，返回 {global_id: (mask, score, labels)}。"""
+def load_predictions(frame_index, segmentation_root, local_to_global, score_threshold=0.0,
+                     max_area_fraction=1.0, image_area=None):
+    """合并同 global_id 的检测掩码，返回 {global_id: (mask, score, labels)}。
+
+    score_threshold / max_area_fraction 会先丢弃低分或超大框检测——用于在
+    不重跑流水线的前提下扫描检测阈值对 AP / 关联指标的影响。
+    max_area_fraction 针对的是 Grounding DINO 的"背景块"失败模式：
+    它会对整片地板/墙面给出一个占据半张图的框，且分数不低。
+    """
 
     instances_path = segmentation_root / f"frame_{frame_index:06d}_instances.json"
     if not instances_path.exists():
@@ -81,6 +98,15 @@ def load_predictions(frame_index, segmentation_root, local_to_global):
     instances = json.load(open(instances_path, encoding="utf-8"))
     merged = {}
     for item in instances:
+        if item.get("detection_score", 1.0) < score_threshold:
+            continue
+        if image_area:
+            box = item.get("box_xyxy")
+            if box:
+                width = max(0.0, box[2] - box[0])
+                height = max(0.0, box[3] - box[1])
+                if (width * height) / image_area > max_area_fraction:
+                    continue
         global_id = local_to_global.get(item["local_instance_id"])
         if global_id is None:
             continue
@@ -171,25 +197,14 @@ def average_precision(records, total_gt, threshold):
     }
 
 
-def main():
-    args = parse_arguments()
+def evaluate_pass(args, tracking, segmentation_root, object_to_class, class_filter,
+                  frames, score_threshold, max_area_fraction=1.0):
+    """跑一遍全帧评测，返回聚合结构。
 
-    tracking = load_tracking(args.tracking_json)
-    segmentation_root = Path(args.segmentation_root)
-    gt_root = Path(args.gt_root)
-    manifest = json.load(open(gt_root / "gt_manifest.json", encoding="utf-8"))
-    object_to_class = {int(k): v for k, v in manifest["object_id_to_class"].items()}
-    class_filter = None
-    if args.gt_classes:
-        class_filter = {name.strip() for name in args.gt_classes.split(",") if name.strip()}
+    score_threshold / max_area_fraction 用于扫描检测过滤条件。
+    """
 
-    end_frame = args.end_frame if args.end_frame is not None else max(tracking)
-    frames = sorted(
-        index for index in tracking
-        if args.start_frame <= index <= end_frame
-        and (gt_root / "instance_masks" / f"instance{index:06d}.png").exists()
-    )
-
+    image_area = args.image_width * args.image_height
     all_records = []  # (score, matched_iou, frame, global_id, gt_id, labels)
     total_gt = 0
     unassigned = 0
@@ -201,7 +216,7 @@ def main():
 
     for frame_index in frames:
         gt_image = cv2.imread(
-            str(gt_root / "instance_masks" / f"instance{frame_index:06d}.png"),
+            str(Path(args.gt_root) / "instance_masks" / f"instance{frame_index:06d}.png"),
             cv2.IMREAD_UNCHANGED,
         )
         if gt_image is None:
@@ -211,19 +226,18 @@ def main():
             int(value) for value in np.unique(gt_image)
             if value != 0
             and (gt_image == value).sum() >= args.min_gt_area
-            and (
-                class_filter is None
-                or object_to_class.get(int(value)) in class_filter
-            )
+            and (class_filter is None or object_to_class.get(int(value)) in class_filter)
         ]
         total_gt += len(gt_ids)
 
         local_to_global = tracking[frame_index]
-        predictions = load_predictions(frame_index, segmentation_root, local_to_global)
+        predictions = load_predictions(
+            frame_index, segmentation_root, local_to_global, score_threshold,
+            max_area_fraction, image_area,
+        )
         unassigned += sum(1 for gid in local_to_global.values() if gid is None)
 
         matches = greedy_match(predictions, gt_ids, gt_image)
-        matched_globals = {global_id for _, global_id, _ in matches}
 
         for global_id, (mask, score, labels) in predictions.items():
             matched = next(((iou, gt_id) for iou, g, gt_id in matches if g == global_id), None)
@@ -247,10 +261,82 @@ def main():
             "matched_at_half": sum(1 for iou, _, _ in matches if iou >= 0.5),
         }
 
+    return {
+        "all_records": all_records,
+        "total_gt": total_gt,
+        "unassigned": unassigned,
+        "gt_to_tracks": gt_to_tracks,
+        "track_to_gts": track_to_gts,
+        "label_consistent": label_consistent,
+        "label_total": label_total,
+        "frame_summaries": frame_summaries,
+    }
+
+
+def main():
+    args = parse_arguments()
+
+    tracking = load_tracking(args.tracking_json)
+    segmentation_root = Path(args.segmentation_root)
+    gt_root = Path(args.gt_root)
+    manifest = json.load(open(gt_root / "gt_manifest.json", encoding="utf-8"))
+    object_to_class = {int(k): v for k, v in manifest["object_id_to_class"].items()}
+    class_filter = None
+    if args.gt_classes:
+        class_filter = {name.strip() for name in args.gt_classes.split(",") if name.strip()}
+
+    end_frame = args.end_frame if args.end_frame is not None else max(tracking)
+    frames = sorted(
+        index for index in tracking
+        if args.start_frame <= index <= end_frame
+        and (gt_root / "instance_masks" / f"instance{index:06d}.png").exists()
+    )
+
+    result = evaluate_pass(args, tracking, segmentation_root, object_to_class,
+                           class_filter, frames, args.min_score, args.max_area_fraction)
+    all_records = result["all_records"]
+    total_gt = result["total_gt"]
+    unassigned = result["unassigned"]
+    gt_to_tracks = result["gt_to_tracks"]
+    track_to_gts = result["track_to_gts"]
+    label_consistent = result["label_consistent"]
+    label_total = result["label_total"]
+    frame_summaries = result["frame_summaries"]
+
     detection = {
         f"iou_{threshold:g}": average_precision(all_records, total_gt, threshold)
         for threshold in args.iou_thresholds
     }
+
+    # 检测过滤条件扫描：不重跑流水线，只在评测阶段过滤检测，
+    # 用来回答"提高分数阈值 / 砍掉超大框能不能消掉误检、代价是多少"。
+    def summarise_pass(score_threshold, max_area_fraction):
+        sweep = evaluate_pass(args, tracking, segmentation_root, object_to_class,
+                              class_filter, frames, score_threshold, max_area_fraction)
+        matched_gt = len(sweep["gt_to_tracks"])
+        single = sum(1 for tracks in sweep["gt_to_tracks"].values() if len(tracks) == 1)
+        return {
+            "score_threshold": score_threshold,
+            "max_area_fraction": max_area_fraction,
+            "predictions": sum(f["predictions"] for f in sweep["frame_summaries"].values()),
+            "detection": {
+                f"iou_{t:g}": average_precision(sweep["all_records"], sweep["total_gt"], t)
+                for t in args.iou_thresholds
+            },
+            "matched_gt_objects": matched_gt,
+            "single_track_ratio": round(single / matched_gt, 4) if matched_gt else None,
+            "label_consistency": {
+                "consistent": sweep["label_consistent"],
+                "total": sweep["label_total"],
+                "ratio": (round(sweep["label_consistent"] / sweep["label_total"], 4)
+                          if sweep["label_total"] else None),
+            },
+        }
+
+    score_sweep = {"%.2f" % threshold: summarise_pass(threshold, args.max_area_fraction)
+                   for threshold in (args.score_sweep or [])}
+    area_sweep = {"%.2f" % fraction: summarise_pass(args.min_score, fraction)
+                  for fraction in (args.area_sweep or [])}
 
     fragmentation = {
         gt_id: sorted(tracks) for gt_id, tracks in gt_to_tracks.items() if len(tracks) > 1
@@ -273,6 +359,10 @@ def main():
         "min_gt_area": args.min_gt_area,
         "unassigned_observations": unassigned,
         "detection": detection,
+        "min_score": args.min_score,
+        "max_area_fraction": args.max_area_fraction,
+        "score_sweep": score_sweep,
+        "area_sweep": area_sweep,
         "association": {
             "iou_threshold": args.association_iou,
             "matched_gt_objects": matched_gt_objects,
@@ -321,6 +411,32 @@ def main():
     )
     if label_total:
         print(f"标签一致性: {label_consistent}/{label_total} = {report['label_consistency']['ratio']}")
+
+    if score_sweep:
+        print("\n检测分数阈值扫描（不重跑流水线，仅评测阶段过滤）")
+        print("%8s %10s  %s  %8s %8s %8s" %
+              ("score", "preds", "  ".join("%-10s" % f"iou_{t:g}" for t in args.iou_thresholds),
+               "GT匹配", "单轨率", "标签一致"))
+        for key in sorted(score_sweep, key=lambda k: float(k)):
+            row = score_sweep[key]
+            cells = "  ".join("%-10.4f" % row["detection"][f"iou_{t:g}"]["ap"]
+                              for t in args.iou_thresholds)
+            print("%8s %10d  %s  %8d %8s %8s" %
+                  (key, row["predictions"], cells, row["matched_gt_objects"],
+                   row["single_track_ratio"], row["label_consistency"]["ratio"]))
+
+    if area_sweep:
+        print("\n框面积占比上限扫描（针对背景块误检）")
+        print("%8s %10s  %s  %8s %8s %8s" %
+              ("maxarea", "preds", "  ".join("%-10s" % f"iou_{t:g}" for t in args.iou_thresholds),
+               "GT匹配", "单轨率", "标签一致"))
+        for key in sorted(area_sweep, key=lambda k: float(k)):
+            row = area_sweep[key]
+            cells = "  ".join("%-10.4f" % row["detection"][f"iou_{t:g}"]["ap"]
+                              for t in args.iou_thresholds)
+            print("%8s %10d  %s  %8d %8s %8s" %
+                  (key, row["predictions"], cells, row["matched_gt_objects"],
+                   row["single_track_ratio"], row["label_consistency"]["ratio"]))
     print(f"报告: {output_path}")
 
 
