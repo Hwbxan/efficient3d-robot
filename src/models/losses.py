@@ -17,10 +17,13 @@ def semantic_loss(logits, target, class_weights=None, ignore_index=IGNORE_CLASS)
 
     `class_weights` 用来对抗结构性类别（wall/floor/ceiling）的面积优势；
     由 `compute_class_weights` 从数据集直方图算出。
+
+    显式升 float32：AMP 下 logits 可能是 half，而 softmax 的归一化项对精度敏感；
+    autocast 本来也会为 cross_entropy 做这个升位，这里写出来是为了不依赖隐式行为。
     """
 
     return F.cross_entropy(
-        logits.reshape(-1, logits.shape[-1]),
+        logits.reshape(-1, logits.shape[-1]).float(),
         target.reshape(-1),
         weight=class_weights,
         ignore_index=ignore_index,
@@ -49,7 +52,15 @@ def discriminative_loss(
     ⚠️ `ignore_instance=0` 沿用 Replica 的约定：**object_id 0 表示无标注**。
     如果换成从 0 开始编号的实例数据集，必须显式传 `ignore_instance=None`
     之类的哨兵值，否则编号 0 的那个实例会被静默丢掉。
+
+    ⚠️ 内部统一升到 **float32** 再算。AMP 下 encoder 输出可能是 half，而这个损失
+    全是"按实例累加 / 求均值"的归约：half 既丢精度也容易在点数多时溢出，
+    而且 `.norm()` 在 autocast 下会升到 float32，与 half 的累加器混用会直接抛
+    `index_add_(): self (Half) and source (Float) must have the same scalar type`。
+    （这个 bug 只在 `--amp` 下出现，CPU 冒烟测试测不到。）
     """
+
+    embedding = embedding.float()
 
     if embedding.numel() == 0:
         zero = embedding.sum() * 0.0
@@ -106,12 +117,15 @@ def text_alignment_loss(text_embedding, class_id, text_bank, temperature=0.07,
     用 InfoNCE 而不是朴素的 `1 - cos`：后者存在退化解——把所有点映到
     一个对**所有**文本都中等相似的位置即可。对比形式逼模型在同批次的
     类别之间做区分，避免塌缩。
+
+    显式升 float32：相似度矩阵是 `(N, 类别数)`，softmax 要在这个矩阵上做
+    归一化，half 精度的累积误差会直接改变梯度方向。
     """
 
     if text_embedding.numel() == 0 or text_bank.numel() == 0:
         return text_embedding.sum() * 0.0
 
-    logits = text_embedding @ text_bank.t() / temperature
+    logits = (text_embedding.float() @ text_bank.float().t()) / temperature
     return F.cross_entropy(
         logits.reshape(-1, logits.shape[-1]),
         class_id.reshape(-1),

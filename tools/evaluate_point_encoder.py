@@ -46,6 +46,8 @@ def parse_arguments():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--ignore-class", type=int, default=-1)
     parser.add_argument("--ignore-instance", type=int, default=0)
+    parser.add_argument("--min-val-support", type=int, default=200,
+                        help="宏平均 IoU 的支撑度门槛（与 train_point_encoder 同口径）")
     parser.add_argument("--min-instance-points", type=int, default=20,
                         help="参与实例指标的最小点数，避免极小实例主导统计")
     parser.add_argument("--cluster-k", type=int, default=8)
@@ -62,12 +64,23 @@ def parse_arguments():
 # --------------------------------------------------------------------------- #
 
 
-def semantic_metrics(prediction, target, num_classes, ignore_index=-1):
-    """逐点准确率 + mIoU + 逐类 IoU。"""
+def semantic_metrics(prediction, target, num_classes, ignore_index=-1, min_support=200):
+    """逐点准确率 + mIoU + 逐类 IoU。
+
+    与 `train_point_encoder.metrics_from_confusion` **必须口径一致**，
+    否则训练日志和评测报告会给出两个"mIoU"，无法比较。
+
+    同时给三个口径：`miou`（所有出现过的类）、`miou_supported`
+    （GT 点数 ≥ min_support 的类）、`frequency_weighted_iou`（按点数加权）。
+    87 类的 Replica 上，长尾类别会把全类宏平均压到真实水平的三分之一左右。
+    """
 
     valid = target != ignore_index
     if not valid.any():
-        return {"points": 0, "accuracy": None, "miou": None}
+        return {"points": 0, "accuracy": None, "miou": None,
+                "miou_supported": None, "classes_supported": 0,
+                "frequency_weighted_iou": None, "min_support": int(min_support),
+                "per_class_support": [0] * num_classes}
 
     predicted = prediction[valid]
     truth = target[valid]
@@ -87,12 +100,21 @@ def semantic_metrics(prediction, target, num_classes, ignore_index=-1):
     iou = np.zeros(num_classes, dtype=np.float64)
     iou[present] = intersection[present] / np.maximum(union[present], 1e-9)
 
+    supported = present & (ground_truth >= min_support)
+    weight = ground_truth[present]
+    weighted = float((iou[present] * weight).sum() / weight.sum()) if weight.sum() else 0.0
+
     return {
         "points": total,
         "accuracy": round(correct / total, 4) if total else None,
         "miou": round(float(iou[present].mean()), 4) if present.any() else None,
+        "miou_supported": round(float(iou[supported].mean()), 4) if supported.any() else None,
         "classes_present": int(present.sum()),
+        "classes_supported": int(supported.sum()),
+        "frequency_weighted_iou": round(weighted, 4),
+        "min_support": int(min_support),
         "per_class_iou": [round(float(value), 4) for value in iou.tolist()],
+        "per_class_support": [int(value) for value in ground_truth.tolist()],
         "confusion": confusion.tolist(),
     }
 
@@ -333,6 +355,7 @@ def main():
 
     total_confusion = np.zeros((num_classes, num_classes), dtype=np.int64)
     all_predictions, all_targets = [], []
+    all_open_vocab = []
 
     for scene, arrays in clouds.items():
         features = build_features(arrays)
@@ -348,15 +371,20 @@ def main():
         prediction = logits.argmax(axis=-1).astype(np.int64)
         entry = {
             "points": int(target.shape[0]),
-            "semantic": semantic_metrics(prediction, target, num_classes, args.ignore_class),
+            "semantic": semantic_metrics(
+                prediction, target, num_classes, args.ignore_class, args.min_val_support
+            ),
         }
         all_predictions.append(prediction)
         all_targets.append(target)
 
         if text_embedding is not None and text_bank is not None:
             open_vocab = (text_embedding @ text_bank.t()).argmax(dim=-1).cpu().numpy()
+            open_vocab = open_vocab.astype(np.int64)
+            all_open_vocab.append(open_vocab)
             entry["open_vocab"] = semantic_metrics(
-                open_vocab.astype(np.int64), target, num_classes, args.ignore_class
+                open_vocab, target, num_classes,
+                args.ignore_class, args.min_val_support,
             )
 
         # 实例指标：抽稀以控制邻域开销，但抽稀是等距的（Morton 排序后更均匀）
@@ -376,7 +404,10 @@ def main():
 
         report["per_scene"][scene] = entry
         message = (f"  {scene}: {entry['points']:,} 点  准确率 {entry['semantic']['accuracy']}"
-                   f"  mIoU {entry['semantic']['miou']}")
+                   f"  mIoU {entry['semantic']['miou']}"
+                   f"(≥{args.min_val_support}点 {entry['semantic']['miou_supported']},"
+                   f" {entry['semantic']['classes_supported']}类)"
+                   f"  加权IoU {entry['semantic']['frequency_weighted_iou']}")
         if "open_vocab" in entry:
             message += f"  开放词汇 mIoU {entry['open_vocab']['miou']}"
         oracle = entry["instance_oracle"]["purity"]
@@ -388,13 +419,20 @@ def main():
     concatenated_target = np.concatenate(all_targets)
     report["overall"] = {
         "semantic": semantic_metrics(
-            concatenated_prediction, concatenated_target, num_classes, args.ignore_class
+            concatenated_prediction, concatenated_target, num_classes,
+            args.ignore_class, args.min_val_support,
         ),
     }
     # 逐场景 mIoU 的宏平均，和按点数加权一起给——两者差异大说明小场景被淹没
     miou_values = [entry["semantic"]["miou"] for entry in report["per_scene"].values()
                    if entry["semantic"]["miou"] is not None]
     report["overall"]["macro_miou"] = round(float(np.mean(miou_values)), 4) if miou_values else None
+    # 开放词汇分支也要给总体数：只报逐场景、不报总体，会让报告看起来缺一块
+    if all_open_vocab:
+        report["overall"]["open_vocab"] = semantic_metrics(
+            np.concatenate(all_open_vocab), concatenated_target, num_classes,
+            args.ignore_class, args.min_val_support,
+        )
     report["overall"]["per_class_names"] = class_names
 
     output_path = Path(args.output)
@@ -405,6 +443,11 @@ def main():
     overall = report["overall"]["semantic"]
     print(f"\n总体：{overall['points']:,} 点  准确率 {overall['accuracy']}  "
           f"mIoU {overall['miou']}（宏平均 {report['overall']['macro_miou']}）")
+    print(f"      支撑度≥{args.min_val_support} 点：mIoU {overall['miou_supported']}"
+          f"（{overall['classes_supported']}/{overall['classes_present']} 类）"
+          f"  频率加权 IoU {overall['frequency_weighted_iou']}")
+    if "open_vocab" in report["overall"]:
+        print(f"      开放词汇 mIoU {report['overall']['open_vocab']['miou']}")
     print(f"报告：{output_path}")
 
 

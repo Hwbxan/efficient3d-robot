@@ -71,6 +71,9 @@ def parse_arguments():
     parser.add_argument("--max-steps", type=int, default=None,
                         help="每 epoch 最多多少步，用于快速冒烟验证")
     parser.add_argument("--val-every", type=int, default=1)
+    parser.add_argument("--min-val-support", type=int, default=200,
+                        help="宏平均 IoU 的支撑度门槛：只统计验证集 GT 点数 ≥ 该值的类别，"
+                             "避免长尾类别用个位数点数把宏平均拉成噪声")
     parser.add_argument("--no-augment", action="store_true")
     parser.add_argument("--scene-limit", type=int, default=None)
     return parser.parse_args()
@@ -94,8 +97,23 @@ def confusion_from_predictions(confusion, prediction, target, num_classes, ignor
     return confusion + counts.reshape(num_classes, num_classes)
 
 
-def metrics_from_confusion(confusion):
-    """从混淆矩阵算逐点准确率与 mIoU（只统计出现过的类别）。"""
+def metrics_from_confusion(confusion, min_support=200):
+    """从混淆矩阵算逐点准确率与 mIoU。
+
+    **必须同时报三个口径**，只报 `miou` 会严重误导：
+
+    - `miou` —— 所有在验证集出现过的类别（GT 点数 > 0）的宏平均。
+      Replica 有 87 类，长尾类别在验证块里可能只落进个位数的点，
+      这些类别的 IoU 基本是噪声（0 或 1），却和 wall/floor 等权平均。
+      实测 87 类模型：`miou` 0.158，但按点数加权的 IoU 是 0.523。
+    - `miou_supported` —— 只统计 GT 点数 ≥ `min_support` 的类别。
+      这是"模型在数据足够的类别上到底行不行"的诚实口径。
+    - `frequency_weighted_iou` —— 按各类 GT 点数加权。
+      回答"随便挑一个点，平均分割得多好"。
+
+    `per_class_support` 一并返回，方便事后按支撑度分档分析，
+    不必再去翻 manifest（manifest 是全局直方图，与验证块内的分布并不相同）。
+    """
 
     total = confusion.sum().item()
     correct = torch.diagonal(confusion).sum().item()
@@ -107,41 +125,94 @@ def metrics_from_confusion(confusion):
     union = ground_truth + predicted - intersection
 
     present = ground_truth > 0
-    if not present.any():
-        return {"accuracy": accuracy, "miou": 0.0, "classes_present": 0}
     iou = torch.zeros_like(intersection)
+    if not present.any():
+        return {
+            "accuracy": round(accuracy, 4), "miou": 0.0, "classes_present": 0,
+            "miou_supported": 0.0, "classes_supported": 0,
+            "frequency_weighted_iou": 0.0, "min_support": int(min_support),
+            "per_class_iou": [0.0] * int(confusion.shape[0]),
+            "per_class_support": [0] * int(confusion.shape[0]),
+        }
     iou[present] = intersection[present] / union[present].clamp(min=1e-9)
+
+    supported = present & (ground_truth >= min_support)
+    weight = ground_truth[present]
+    weighted = float((iou[present] * weight).sum() / weight.sum()) if weight.sum() else 0.0
+
     return {
         "accuracy": round(accuracy, 4),
         "miou": round(float(iou[present].mean()), 4),
         "classes_present": int(present.sum()),
+        "miou_supported": round(float(iou[supported].mean()), 4) if supported.any() else 0.0,
+        "classes_supported": int(supported.sum()),
+        "frequency_weighted_iou": round(weighted, 4),
+        "min_support": int(min_support),
         "per_class_iou": [round(float(value), 4) for value in iou.tolist()],
+        "per_class_support": [int(value) for value in ground_truth.tolist()],
     }
 
 
 @torch.no_grad()
-def evaluate(model, loader, num_classes, device, max_steps=None, text_bank=None):
-    """在验证集上跑一遍，返回逐点准确率与 mIoU。"""
+def evaluate(model, loader, num_classes, device, max_steps=None, text_bank=None,
+             min_support=200):
+    """在验证集上跑一遍，**两路预测分开统计**。
+
+    返回 `{"semantic": {...}}`，若有文本库则再加 `{"open_vocab": {...}}`：
+
+    - `semantic`   —— 语义头 argmax（监督分支，有直接梯度）
+    - `open_vocab` —— `嵌入 @ 文本嵌入.T` argmax（开放词汇分支）
+
+    **为什么要分开**：早期版本只统计后者，却在日志里写成"验证 mIoU"。
+    文本分支的损失权重通常只有 0.1，本来就学得慢，于是日志会显示一条
+    近乎不动、甚至下滑的曲线，看起来像"监督分支没学到东西"——
+    实际上监督分支一直在正常收敛。选 `best.pt` 也必须用监督分支，
+    否则等于让最弱的一路决定检查点。
+    """
 
     model.eval()
-    confusion = torch.zeros(num_classes, num_classes, dtype=torch.int64)
+    semantic_confusion = torch.zeros(num_classes, num_classes, dtype=torch.int64)
+    text_confusion = (
+        torch.zeros(num_classes, num_classes, dtype=torch.int64)
+        if text_bank is not None else None
+    )
     steps = 0
     for features, class_id, instance in loader:
         features = features.to(device, non_blocking=True)
         class_id = class_id.to(device, non_blocking=True)
         output = model(features)
-        if text_bank is not None:
-            prediction = (output.text_embedding @ text_bank.t()).argmax(dim=-1)
-        else:
-            prediction = output.semantic_logits.argmax(dim=-1)
-        confusion = confusion_from_predictions(
-            confusion, prediction.cpu(), class_id.cpu(), num_classes
+
+        semantic_confusion = confusion_from_predictions(
+            semantic_confusion,
+            output.semantic_logits.argmax(dim=-1).cpu(),
+            class_id.cpu(), num_classes,
         )
+        if text_confusion is not None:
+            text_confusion = confusion_from_predictions(
+                text_confusion,
+                (output.text_embedding @ text_bank.t()).argmax(dim=-1).cpu(),
+                class_id.cpu(), num_classes,
+            )
         steps += 1
         if max_steps and steps >= max_steps:
             break
     model.train()
-    return metrics_from_confusion(confusion)
+
+    result = {"semantic": metrics_from_confusion(semantic_confusion, min_support)}
+    if text_confusion is not None:
+        result["open_vocab"] = metrics_from_confusion(text_confusion, min_support)
+    return result
+
+
+# 检查点选择口径：只用监督分支。改这里等于改"什么算更好的模型"，
+# 所以单独提出来，避免散落在 main 里。
+SELECTION_METRIC = "semantic.miou"
+
+
+def selection_score(val_metrics):
+    """从 evaluate() 的返回值里取出用于挑选 best.pt 的分数。"""
+
+    return val_metrics["semantic"]["miou"]
 
 
 # --------------------------------------------------------------------------- #
@@ -323,10 +394,12 @@ def main():
             val_metrics = evaluate(
                 model, val_loader, num_classes, device,
                 max_steps=args.max_steps, text_bank=text_bank,
+                min_support=args.min_val_support,
             )
             record["val"] = val_metrics
-            if val_metrics["miou"] > best_miou:
-                best_miou = val_metrics["miou"]
+            score = selection_score(val_metrics)
+            if score > best_miou:
+                best_miou = score
                 torch.save(
                     {
                         "model": model.state_dict(),
@@ -334,6 +407,8 @@ def main():
                         "class_names": list(class_names),
                         "epoch": epoch,
                         "val_metrics": val_metrics,
+                        "selection_metric": SELECTION_METRIC,
+                        "selection_score": round(score, 6),
                     },
                     output_directory / "best.pt",
                 )
@@ -345,8 +420,13 @@ def main():
         if args.instance_loss_weight > 0:
             message += f"  实例 {train_metrics['instance']:.4f}"
         if "val" in record:
-            message += (f"  | 验证 mIoU {record['val']['miou']:.4f}"
-                        f"  准确率 {record['val']['accuracy']:.4f}")
+            semantic = record["val"]["semantic"]
+            message += (f"  | 语义mIoU {semantic['miou']:.4f}"
+                        f"(≥{args.min_val_support}点 {semantic['miou_supported']:.4f})"
+                        f" 加权IoU {semantic['frequency_weighted_iou']:.4f}"
+                        f" 准确率 {semantic['accuracy']:.4f}")
+            if "open_vocab" in record["val"]:
+                message += f" 开放词汇mIoU {record['val']['open_vocab']['miou']:.4f}"
         message += f"  {record['seconds']}s"
         print(message, flush=True)
 
@@ -358,6 +438,7 @@ def main():
                     "parameter_count": total,
                     "class_names": list(class_names),
                     "best_val_miou": best_miou,
+                    "best_metric": SELECTION_METRIC,
                     "history": history,
                 },
                 ensure_ascii=False,
@@ -366,7 +447,7 @@ def main():
             encoding="utf-8",
         )
 
-    print(f"\n最佳验证 mIoU {best_miou:.4f}")
+    print(f"\n最佳验证 {SELECTION_METRIC} {best_miou:.4f}")
     print(f"检查点 {output_directory / 'best.pt'}")
     print(f"训练日志 {log_path}")
 
