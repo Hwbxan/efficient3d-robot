@@ -44,7 +44,7 @@ rewritten into an NPU-deployable form and shipped to a Rockchip RK3588 (6 TOPS I
 
 **开放词汇文本检索**（CLIP 图像嵌入 × 文本查询，6 类常见词，按「物体存在」
 的场景宏平均 AP）：chair 0.84 / trash can 0.82 / sofa 0.77 / desk 0.73 /
-door 0.63 / computer monitor 0.23（小屏显示器受 2D 检测器漏检限制，见局限）。
+door 0.63 / computer monitor 0.23（显示器召回 100%，弱在检索排序，见局限）。
 
 **实时性**：RTX 3090 单进程在线推理 **6.15 FPS（162 ms/帧）**，瓶颈是
 Grounding DINO（~130 ms）。
@@ -145,7 +145,7 @@ flowchart TD
 | sofa | 0.769 | 稳 |
 | desk | 0.734 | 稳 |
 | door | 0.625 | 中等 |
-| computer monitor | **0.229** | 弱：受 2D 检测器对小屏漏检限制（详见局限） |
+| computer monitor | **0.229** | 弱：召回 100%，但排序靠后（详见局限） |
 
 整体（存在场景）平均 AP **0.669**；含「无该物体」场景的口径为 0.556。
 复现：`python -m tools.run_multiscene_open_vocab --scenes office_0 office_1 ...`
@@ -407,12 +407,26 @@ Three.js 渲染）打开即是一个浏览器内的 3D 实例点云查看器，�
 # 2) 本地起服务并打开
 cd outputs/demo_a_viewer && python3 -m http.server 8137
 #   浏览器访问 http://localhost:8137/index.html
+
+# 3) 打包成自包含单文件（内联 Three.js + 全部 8 场景数据，约 6.5 MB）
+python -m tools.build_selfcontained_viewer
+#   产出 demo_a/demo_a_viewer_standalone.html
+#   —— 不依赖服务器、不联网，下载到本地双击即可打开
 ```
+
+> 注意：多文件版依赖 `data/` 与 `vendor/` 相对路径，必须经 http 服务打开；
+> 而沙箱里的 `localhost:8137` 只在沙箱内部可达，外部浏览器访问不到。
+> 因此对外交付一律用第 3 步的**自包含单文件**。
 
 ### 2. 实时建图短视频（mp4）
 
 `tools/make_demo_video.py` 用 matplotlib 离屏渲染一段「逐步建图 + 文本查询高亮」视频
-（默认 office_0，查询 `chair`），输出 `outputs/demo_video/office_0_demo.mp4`，可直接嵌进幻灯片。
+（默认 office_0，查询 `chair`）：**1280×720 / 15fps / 8 秒**，前 70% 按 `first_seen_frame`
+逐步揭示实例模拟在线建图，后 30% 演示文本查询高亮。输出
+`outputs/demo_video/office_0_demo.mp4`，可直接嵌进幻灯片。
+
+查询高亮使用**自适应阈值**（`max_score − max(0.02, std)`）而非固定阈值：CLIP 图文
+余弦值挤在 0.20–0.30 的窄带内，固定阈值 0.20 会把 19 个实例全部判为命中、整屏全黄。
 
 ```bash
 /miniconda3/bin/python3 -m tools.make_demo_video \
@@ -433,11 +447,17 @@ cd outputs/demo_a_viewer && python3 -m http.server 8137
 
 诚实列出，避免误导：
 
-- **小屏显示器检索弱。** 开放词汇里 computer monitor 的存在场景 AP 只有 0.229，
-  根因是 **2D 检测器漏检**：在 office_1（18 个 GT 显示器）里 Grounding DINO
-  只稳定检出 2–3 个屏幕，其余 16 个合成小屏从未被检测成实例，跟踪/关联无从补救。
-  降检测框阈值到 0.20 也只多检出 1 个（2→3），属开放词汇检测器的长尾小物体通病，
-  不是本流水线的 bug。换成更高分辨率 / 多尺度检测或更强的开放词汇检测器才能根治。
+- **小屏显示器检索弱 —— 已定位为「排序问题」，不是漏检。** 开放词汇里 computer
+  monitor 的存在场景 AP 只有 0.229。实测三点，纠正此前的误判（曾误记为「18 个
+  GT 显示器只检出 2–3 个」）：
+  - **召回其实是 100%**：8 个场景里仅 office_0 / office_1 各含 1 个 GT 显示器
+    （其余 6 个场景 GT 数为 0），两场景 recall 均为 **1.0** —— 显示器都进了地图。
+  - **弱在 CLIP 检索排序**：office_0 真显示器排第 1（AP 1.0），office_1 排第 7
+    （AP = 1/7 ≈ 0.143，p@5 = 0）；且每场景会多出 1 个误标为 monitor 的实例。
+  - **多尺度检测已验证无效**：把检测分辨率从默认短边 800 提到 1200（必须覆盖
+    processor 的 `size`；单纯放大输入图会被再次归一化而完全无效），office_1
+    显示器检出数 18 → 17（不升反微降），单帧耗时 164ms → 453ms（**×2.75**）。
+    叠加此前 Grounding DINO base 零收益的结论：**不更换检测器、不启用多尺度**。
 - **精度不占优。** AP@0.50 只有 0.519（8 场景宏平均），掩码 IoU ≥0.5 的比例约 64%。
   过分割是主要问题，根因在 2D 分割前端 —— 这与 OVI-MAP 论文 Table 5 的结论一致
   （SAM2 → CropFormer 让 instance AP50 从 27.8 涨到 50.8）。

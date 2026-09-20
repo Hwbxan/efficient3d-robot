@@ -138,54 +138,78 @@ class GroundingDinoDetector:
             ]
         return detections
 
-    @torch.inference_mode()
-    def predict(
-        self,
-        rgb: np.ndarray,
-        text_queries: List[str],
-        box_threshold: float = 0.25,
-        text_threshold: float = 0.20,
-        resolve_labels: bool = True,
-        max_box_area_fraction: float = 0.40,
-    ) -> List[Detection]:
-        """根据文本类别检测图像中的目标。
+    @staticmethod
+    def _iou(box_a: np.ndarray, box_b: np.ndarray) -> float:
+        """两个 xyxy 框的 IoU。"""
 
-        resolve_labels=True 时，每个框的标签取"该框在各类别 token 上
-        最大概率"最高的类别，避免出现复合标签。
+        x1 = max(box_a[0], box_b[0])
+        y1 = max(box_a[1], box_b[1])
+        x2 = min(box_a[2], box_b[2])
+        y2 = min(box_a[3], box_b[3])
+        inter = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+        area_a = max(0.0, box_a[2] - box_a[0]) * max(0.0, box_a[3] - box_a[1])
+        area_b = max(0.0, box_b[2] - box_b[0]) * max(0.0, box_b[3] - box_b[1])
+        union = area_a + area_b - inter
+        return inter / union if union > 0 else 0.0
 
-        max_box_area_fraction 用于剔除"背景块"误检：Grounding DINO 对
-        短类别词（desk / door / computer monitor）会给出覆盖半张图的大框，
-        且分数不低（0.36~0.78）、类别间间隔也不小，靠分数阈值分不掉
-        ——实测提高分数阈值反而单调降低 AP。
+    @classmethod
+    def merge_multi_scale(cls, detections_per_pass, iou_threshold: float = 0.60):
+        """跨尺度融合：同一物体在多个分辨率下会被重复检出，按类别做 NMS 去重。
 
-        在 Replica office0 上（61 帧、209 个 GT 实例）实测：
-        阈值 0.50 丢 8 个 FP、0 个 TP；0.40 丢 26 个 FP、0 个 TP
-        （AP@0.25 0.5821->0.6252，AP@0.50 0.2581->0.2843，召回不变）；
-        0.30 起开始丢 TP（6 个）。故 0.40 是"零召回代价"的最大过滤强度。
-        设为 1.0 关闭该过滤。
+        每个重复组内保留分数最高的框。
         """
 
-        if rgb.ndim != 3 or rgb.shape[2] != 3:
-            raise ValueError(
-                f"RGB 图像应为 H×W×3，实际为 {rgb.shape}"
-            )
+        groups = {}
+        for detections in detections_per_pass:
+            for detection in detections:
+                groups.setdefault(detection.label, []).append(detection)
 
-        if not text_queries:
-            raise ValueError("text_queries 不能为空")
+        merged = []
+        for label in groups:
+            candidates = sorted(groups[label], key=lambda d: -d.score)
+            kept = []
+            for detection in candidates:
+                if any(
+                    cls._iou(detection.box_xyxy, kept_box.box_xyxy) >= iou_threshold
+                    for kept_box in kept
+                ):
+                    continue
+                kept.append(detection)
+            merged.extend(kept)
+        return merged
 
-        image = Image.fromarray(rgb)
+    @torch.inference_mode()
+    def _forward_single(
+        self,
+        image,
+        text_queries: List[str],
+        box_threshold: float,
+        text_threshold: float,
+        resolve_labels: bool,
+        max_box_area_fraction: float,
+        size=None,
+    ) -> List[Detection]:
+        """在单一分辨率下跑一次前向，size 为 None 时用 processor 默认尺寸。"""
 
-        # 外层列表表示 batch 中只有一张图像。
         batched_text_queries = [text_queries]
 
-        inputs = self.processor(
-            images=image,
-            text=batched_text_queries,
-            return_tensors="pt",
-        )
+        if size is None:
+            inputs = self.processor(
+                images=image,
+                text=batched_text_queries,
+                return_tensors="pt",
+            )
+        else:
+            # 覆盖 processor 的目标尺寸。默认 shortest_edge=800 会把小图统一上采样，
+            # 因此「先放大输入图再送入」是无效的 —— 必须改这里才能真正提高检测分辨率。
+            inputs = self.processor(
+                images=image,
+                text=batched_text_queries,
+                return_tensors="pt",
+                size=size,
+            )
 
         inputs = inputs.to(self.device)
-
         outputs = self.model(**inputs)
 
         if not resolve_labels:
@@ -220,7 +244,6 @@ class GroundingDinoDetector:
         )
         best_score, best_index = category_scores.max(dim=-1)
 
-        # best_score 为 0 表示没有任何类别 token 通过 text_threshold。
         keep = (box_scores > box_threshold) & (best_score > 0)
 
         boxes = self.normalized_to_xyxy(outputs.pred_boxes[0], image.size)
@@ -243,3 +266,63 @@ class GroundingDinoDetector:
             )
 
         return detections
+
+    @torch.inference_mode()
+    def predict(
+        self,
+        rgb: np.ndarray,
+        text_queries: List[str],
+        box_threshold: float = 0.25,
+        text_threshold: float = 0.20,
+        resolve_labels: bool = True,
+        max_box_area_fraction: float = 0.40,
+        multi_scale_sizes: Optional[List[dict]] = None,
+        nms_iou: float = 0.60,
+    ) -> List[Detection]:
+        """根据文本类别检测图像中的目标。
+
+        multi_scale_sizes 给出额外的高分辨率 pass（每项形如
+        {"shortest_edge": 1200, "longest_edge": 2000}）。小物体（如 Replica 中
+        尺寸极小的显示器）在默认 800 短边下容易漏检，提高检测分辨率可提升召回；
+        多 pass 的结果按类别做 NMS 融合去重。为 None 时行为与单尺度完全一致。
+
+
+        resolve_labels=True 时，每个框的标签取"该框在各类别 token 上
+        最大概率"最高的类别，避免出现复合标签。
+
+        max_box_area_fraction 用于剔除"背景块"误检：Grounding DINO 对
+        短类别词（desk / door / computer monitor）会给出覆盖半张图的大框，
+        且分数不低（0.36~0.78）、类别间间隔也不小，靠分数阈值分不掉
+        ——实测提高分数阈值反而单调降低 AP。
+
+        在 Replica office0 上（61 帧、209 个 GT 实例）实测：
+        阈值 0.50 丢 8 个 FP、0 个 TP；0.40 丢 26 个 FP、0 个 TP
+        （AP@0.25 0.5821->0.6252，AP@0.50 0.2581->0.2843，召回不变）；
+        0.30 起开始丢 TP（6 个）。故 0.40 是"零召回代价"的最大过滤强度。
+        设为 1.0 关闭该过滤。
+        """
+
+        if rgb.ndim != 3 or rgb.shape[2] != 3:
+            raise ValueError(
+                f"RGB 图像应为 H×W×3，实际为 {rgb.shape}"
+            )
+
+        if not text_queries:
+            raise ValueError("text_queries 不能为空")
+
+        image = Image.fromarray(rgb)
+
+        # 第 1 pass 用 processor 默认尺寸（等价原有行为）
+        passes = [self._forward_single(
+            image, text_queries, box_threshold, text_threshold,
+            resolve_labels, max_box_area_fraction, None,
+        )]
+        for size in (multi_scale_sizes or []):
+            passes.append(self._forward_single(
+                image, text_queries, box_threshold, text_threshold,
+                resolve_labels, max_box_area_fraction, size,
+            ))
+
+        if len(passes) == 1:
+            return passes[0]
+        return self.merge_multi_scale(passes, nms_iou)

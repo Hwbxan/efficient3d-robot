@@ -103,9 +103,18 @@ python -m tools.run_multiscene_eval --all --real-only --skip-render \
 | computer monitor | **0.229** | 0.143 |
 | **平均** | **0.669** | 0.556 |
 
-computer monitor 弱的根因是 **2D 检测器漏检**（见 README 局限）：office_1 有 18 个
-GT 显示器，Grounding DINO 只稳定检出 2–3 个，跟踪/关联无从补救。其余 5 类达到
-0.6–0.84，作为「可文本查询的 3D 实例地图」已可用。
+computer monitor 弱的原因**不是检测器漏检**（此处更正 README 此前的误判）：
+
+| 场景 | monitor AP | hits / GT | recall | 真显示器排名 |
+|---|---|---|---|---|
+| office_0 | **1.000** | 1 / 1 | 1.0 | 第 1 |
+| office_1 | 0.143 | 1 / 1 | 1.0 | 第 7（p@5 = 0） |
+| 其余 6 个场景 | — | 0 / **0** | — | 场景内无显示器 |
+
+8 个场景**总共只有 2 个 GT 显示器**，且两个都成功进入地图（recall 1.0）。差距来自
+CLIP 图文检索的**排序**：office_0 排第 1，office_1 掉到第 7。因此这是检索排序问题，
+换检测器或加多尺度均无济于事（见下节实验）。其余 5 类达到 0.6–0.84，
+作为「可文本查询的 3D 实例地图」已可用。
 
 **复现**：
 ```bash
@@ -326,6 +335,40 @@ python -m tools._smoke_test_rknn_export
 
 ---
 
+## 5.5 多尺度检测消融（Path C，结论：不采用）
+
+**动机**：改善 computer monitor 这类小物体的检测召回。
+
+**关键实现细节**：不能靠「先放大输入图再送入检测器」——Grounding DINO 的 processor
+默认 `shortest_edge=800`，会把任意尺寸输入**重新归一化**，放大输入图会被抵消掉。
+真正有效的做法是覆盖 processor 的 `size`（实测 800×1066 → 1200×1600 生效）。
+已把该能力以 `multi_scale_sizes` 参数加入 `GroundingDinoDetector.predict`，
+默认为 `None`，行为与单尺度完全一致（不改动既有指标）。
+
+**实验设置**（office_1，均匀采样 60 帧，box-threshold 0.30，max-area 0.40）：
+
+| 指标 | baseline（短边 800） | +1200 短边 pass | 变化 |
+|---|---|---|---|
+| computer monitor 检出数 | 18 | 17 | **−1** |
+| 有 monitor 检出的帧数 | 10 / 60 | 10 / 60 | 0 |
+| 每帧平均 monitor 数 | 0.300 | 0.283 | −0.017 |
+| chair / desk / door / sofa 检出数 | 6 / 11 / 11 / 3 | 6 / 11 / 11 / 3 | 0 |
+| trash can 检出数 | 16 | 14 | −2 |
+| **单帧耗时** | **164 ms** | **453 ms** | **×2.75** |
+
+**结论**：提高检测分辨率**没有带来任何召回增益**，反而因跨尺度 NMS 略微减少检出，
+代价是 2.75 倍延迟。叠加 §1.6 里「monitor 召回本就是 100%」的事实，以及此前
+Grounding DINO base 零收益的测试，判定：**不更换检测器、不启用多尺度**。
+monitor 的短板是 CLIP 检索排序问题，应在检索侧（而非检测侧）解决。
+
+**复现**：
+```bash
+python -m tools.ablate_multiscale_detection --scene office_1 --frames 60 \
+    --extra "1200:2000" --out outputs/multiscale_ablation_office1.json
+```
+
+---
+
 ## 6. 还没做的
 
 诚实列出，避免把静态分析当成实测：
@@ -335,7 +378,8 @@ python -m tools._smoke_test_rknn_export
 - **功耗未测。** 需要 USB-C 功率计。
 - **在线流水线只在 8 个 Nice-SLAM 场景评过。** 其余 10 个 Replica 场景
   （apartment / frl / hotel）只有 mesh/semantic，需自渲染 RGB-D 才能纳入 headline。
-- **computer monitor 检索弱。** 根因是 2D 检测器对小屏漏检（见 README 局限），
-  非流水线 bug，需更强/多尺度开放词汇检测器根治。
+- **computer monitor 检索弱 —— 排序问题，非漏检。** 两场景 recall 均为 1.0，
+  但 office_1 真显示器排第 7。**多尺度检测实验（Path C）已证否**：检测分辨率
+  800→1200 短边后显示器检出 18→17、耗时 ×2.75，故不采用（详见下节）。
 - **端到端延迟未在边缘设备上测。** 桌面 GPU 已到 162.5 ms/帧（6.15 FPS）实时档，
   但这是 RTX 3090 的数字，不等于 RK3588 上的表现。
