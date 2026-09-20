@@ -380,6 +380,55 @@ Morton 的位运算连 ONNX 这一关都过不去，不需要等到上 NPU 才�
 
 ---
 
+## Demo A 可视化交付（不只是指标看板）
+
+完整评测之外，Demo A 还提供了**可交互的 3D 文本查询地图**与一段**实时建图视频**，
+直接展示项目核心卖点——「用一句话在 3D 地图里找出物体」。
+
+### 1. 交互式 3D 文本查询地图（主交付物）
+
+`outputs/demo_a_viewer/`（由 `tools/build_viewer_data.py` 生成数据，`index.html` + 本地 vendored
+Three.js 渲染）打开即是一个浏览器内的 3D 实例点云查看器，支持：
+
+- **8 个 Nice-SLAM 场景**切换，轨道旋转 / 滚轮缩放 / 右键平移；
+- **真实 RGB / 按类别 / 按实例**三种着色；
+- **文本查询高亮**：底部预设查询按钮（椅子、显示器、沙发…共 30 个）用烘焙好的
+  CLIP 文本嵌入即时高亮命中实例；自由文本框则调用**浏览器内 CLIP 文本塔**
+  （transformers.js，真·开放词汇，CDN 不可达时自动回退预设）；
+- **「建图回放」滑块 / 播放按钮**：按 `first_seen_frame` 逐步揭示实例，
+  模拟 RGB-D 相机走过时地图实时生长的过程。
+
+复现：
+
+```bash
+# 1) 生成 8 场景紧凑数据（点云 + CLIP 嵌入 + 首次出现帧 + 烘焙查询）
+/miniconda3/bin/python3 -m tools.build_viewer_data \
+    --eval-root outputs/multiscene_eval_v2 --all --output outputs/demo_a_data --max-points 2000
+# 2) 本地起服务并打开
+cd outputs/demo_a_viewer && python3 -m http.server 8137
+#   浏览器访问 http://localhost:8137/index.html
+```
+
+### 2. 实时建图短视频（mp4）
+
+`tools/make_demo_video.py` 用 matplotlib 离屏渲染一段「逐步建图 + 文本查询高亮」视频
+（默认 office_0，查询 `chair`），输出 `outputs/demo_video/office_0_demo.mp4`，可直接嵌进幻灯片。
+
+```bash
+/miniconda3/bin/python3 -m tools.make_demo_video \
+    --data outputs/demo_a_data --scene office_0 --query chair --frames 120
+```
+
+### 3. 关于换更强开放词汇检测器
+
+在 office_1 上实测了 **Grounding DINO base**（可用的最强本地权重）对比 tiny：
+几何 AP@.25/AP@.50、碎片率、标签一致性**与 tiny 完全一致**，显示器聚类仍是 2 个，
+检测延迟仅 135ms→~155ms。结论：**换 base 对显示器召回和整体精度零收益**，
+不值得为它牺牲实时性。显示器弱点是 Replica 合成小屏本身 + 开放词汇概念映射问题，
+需多尺度 / 更高分辨率检测或专属小物体检测器才能根治，已列为已知局限。
+
+---
+
 ## 局限
 
 诚实列出，避免误导：
