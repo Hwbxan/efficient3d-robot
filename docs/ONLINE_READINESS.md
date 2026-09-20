@@ -21,6 +21,38 @@
 
 ---
 
+## 0.3 输入契约：8 个场景就是 RGB + Depth + 位姿
+
+`datasets/processed/Replica/<scene>/` 的实际构成（8 个场景各 2000 帧，共 16000 帧）：
+
+| 文件 | 内容 | 规格 |
+|---|---|---|
+| `results/frame%06d.jpg` | RGB | 1200×680 |
+| `results/depth%06d.png` | Depth | 1200×680 uint16，÷`DEPTH_SCALE=6553.5` 得米（量程 10 m） |
+| `traj.txt` | 相机位姿 | 每行 16 个数 = 4×4 camera-to-world，行主序，**Z 朝上（场景自身坐标系）** |
+| 内参 | 硬编码 `create_camera_matrix()` | fx=fy=600, cx=599.5, cy=339.5（水平 FOV 90°） |
+
+**来源**：下载的是 Replica v1 原始 mesh（18 场景，含 habitat 配置与语义标注）；
+RGB-D 序列由 `tools/render_replica_sequences.py` 用 habitat-sim **自行渲染**
+（`plan_trajectory()` 生成轨迹并写出 `traj.txt`）。
+选用的 8 个（office_0–4、room_0–2）是 Nice-SLAM 标准子集，故 summary 标记 `source: nice-slam`。
+
+**⚠ 两项"理想化"落差（影响 Demo A 能否迁移到真实数据）：**
+
+1. **位姿零漂移**——程序生成的轨迹完美自洽；真实 SLAM 位姿有累积漂移，
+   而关联判据（体素覆盖率）直接依赖位姿精度，漂了就会碎轨。
+   当前单轨率 0.706 是**零漂位姿下的上界**。
+2. **深度零噪声零空洞**——Habitat 渲染的理想深度；真实 RGB-D 有噪声、飞点，
+   反光面/近距离大面积缺失。管线对深度缺失**很敏感**：
+   扩词表实验中 `window` 检到窗外远景 → `lift_mask_to_world` 抛
+   `ValueError: 实例掩码中没有有效深度` → 整条序列中断（已在 §0.6.2 修复为跳过）。
+   理想深度才让这个问题此前一直没暴露。
+
+**建议补做的验证（尚未做）**：深度加噪/挖洞 + 位姿加漂移的退化测试，
+量化指标掉多少。不补这一步，"Demo A 跑通"只在这套理想数据上成立。
+
+---
+
 ## 0.4 Demo A 需求定义（明确版）与逐条距离
 
 需求方明确的 Demo A 定义：
