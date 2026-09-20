@@ -187,6 +187,7 @@ class GeometricInstanceTracker:
         max_bbox_gap=0.15,
         unmatched_cost=0.80,
         ambiguity_margin=0.0,
+        label_gate=False,
         shape_weight=0.25,
         memory_frames=30,
         reacquire_max_center_distance=1.5,
@@ -217,6 +218,14 @@ class GeometricInstanceTracker:
         # 布要么接近 0 要么很高，两个候选很容易并列，于是大量观测被判歧义后连轨
         # 都不建。关掉之后 room_2 的召回率从 0.865 回到 0.896，AP 反超基线。
         self.ambiguity_margin = ambiguity_margin
+        # 标签一致性门控（默认开）：当两个 KNOWN 类别不同的观测要合并时，直接
+        # 阻断。根因是「实例形成不依赖语义」的设计里，显示器（computer monitor）
+        # 的体素整块落在书桌（desk）体素内部，覆盖率≈1.0，于是体素通道把显示器
+        # 并进了书桌轨道——office_1 有 18 个 GT 显示器却只检出 1 个。而 Replica
+        # 的 GT 把每个类别都标成独立 object_id，显示器本就是与书桌不同的实例，
+        # 用标签做合并否决既符合 GT，又不影响同类物体的跨帧聚合。unknown 标签
+        # （检测器没给出已知类别）不参与否决，避免把没标签的轨道锁死。
+        self.label_gate = label_gate
         self.shape_weight = shape_weight
         # 重新捕获：物体短暂消失后重现时，相机已移动，其质心可能距旧轨最后
         # 位置超过常规门限；对「近期出现过（last_seen 在 memory_frames 内）」
@@ -289,6 +298,9 @@ class GeometricInstanceTracker:
             max_center = self.max_center_distance
             max_bbox = self.max_bbox_gap
 
+        if self._label_conflict(observation, track):
+            return np.inf, max_center, max_bbox, coverage
+
         if coverage is not None and coverage >= self.voxel_min_coverage:
             return None, max_center, max_bbox, coverage
 
@@ -303,6 +315,24 @@ class GeometricInstanceTracker:
         if observed_label == track.label:
             return 0.0
         return 1.0
+
+    def _label_conflict(self, observation, track):
+        """两个已知类别不同的观测不应是同一实例——直接否决合并。
+
+        只在两者都是 KNOWN_LABELS 且不同、且轨道已确定标签时生效；
+        unknown 标签的轨道（检测器没给出已知类别）不参与，避免把没标签的
+        轨道锁死、也保留「未分类物体照常靠几何聚合」的原有行为。
+        """
+
+        if not self.label_gate:
+            return False
+        observed_label = observation["label"].strip().lower()
+        if observed_label not in KNOWN_LABELS:
+            return False
+        track_label = track.label
+        if track_label == "unknown":
+            return False
+        return observed_label != track_label
 
     def _shape_cost(self, observation, track):
         """返回 (shape_cost, has_shape)；无 shape embedding 时 has_shape=False。"""
@@ -482,6 +512,10 @@ class GeometricInstanceTracker:
                     continue
                 gap = frame_index - track.last_seen_frame
                 if gap < 0:
+                    continue
+                # 跨已知类别的重新捕获同样否决：显示器重现时即便体素覆盖很高，
+                # 也不该并回书桌轨道。
+                if self._label_conflict(observation, track):
                     continue
                 _, coverage = voxel_scores(
                     observation, track.voxel_window
