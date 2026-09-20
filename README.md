@@ -430,6 +430,19 @@ python -m tools.make_egocentric_video --scene office_0 --max-frames 200 \
 ```
 
 产出 `outputs/demo_video/office_0_ego.mp4`（1200×680 / 20fps / 10 秒，19 个实例）。
+
+> **要流畅视频必须用连续帧。** 正式评测为省算力把检测+SAM2 的步长设成 10
+> （`--frame-stride 10`），直接拿这些帧拼视频会明显跳动。用步长 1 重跑同一场景即可
+> 得到逐帧掩码，拼起来就是连续视频（241 帧约 167 秒，AP@0.25=0.680、单轨率 1.000）：
+>
+> ```bash
+> python -m tools.run_multiscene_eval --scenes office_0 --frame-stride 1 \
+>     --end-frame 240 --output-root outputs/dense_office0 --skip-render \
+>     --dino-model checkpoints/grounding-dino-tiny
+> python -m tools.make_egocentric_video --scene office_0 \
+>     --eval-root outputs/dense_office0 --max-frames 241 --fps 24 \
+>     --out outputs/demo_video_dense
+> ```
 数据来自逐帧分割 `frame_*_instances.json` 与跨帧关联 `association/tracking.json`
 （用 `global_id` 保证同一物体的名称与颜色全程稳定）。掩码默认**只描边不填充**：
 逐帧掩码是多边形近似，填充会盖住真实画面（`--mask-alpha 0.35` 可恢复填充）。
