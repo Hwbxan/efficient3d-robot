@@ -33,16 +33,20 @@ import numpy as np
 
 # 查询词 → 可接受的 GT 类别。Replica 的类别名与检测器词表并不一致，
 # 例如 detector 说 "desk"，Replica 标注是 "table"。
+# 注：必须与 evaluate_against_gt.py 的 LABEL_SYNONYMS 保持一致。
+# Replica 的 GT 类名直接用 monitor / desk / basket / stool / armchair 等，
+# 若这里只写 tv-screen/tablet/table 会漏掉大量 GT 物体，把它们错算成
+# "无相关实例"（relevant_total=0），进而把该查询的 AP 记成 0。
 DEFAULT_TARGETS = {
-    "chair": ["chair", "sofa"],
-    "sofa": ["sofa", "chair"],
-    "couch": ["sofa", "chair"],
-    "trash can": ["bin", "tissue-paper"],
-    "garbage bin": ["bin", "tissue-paper"],
-    "computer monitor": ["tv-screen", "tablet"],
-    "monitor": ["tv-screen", "tablet"],
-    "desk": ["table", "desk-organizer", "panel"],
-    "table": ["table", "desk-organizer", "panel"],
+    "chair": ["chair", "sofa", "stool", "armchair"],
+    "sofa": ["sofa", "couch"],
+    "couch": ["sofa", "couch"],
+    "trash can": ["bin", "tissue-paper", "basket"],
+    "garbage bin": ["bin", "tissue-paper", "basket"],
+    "computer monitor": ["tv-screen", "tablet", "monitor"],
+    "monitor": ["tv-screen", "tablet", "monitor"],
+    "desk": ["table", "desk", "desk-organizer", "panel"],
+    "table": ["table", "desk", "desk-organizer", "panel"],
     "door": ["door"],
     "plant": ["indoor-plant", "plant-stand"],
     "rug": ["rug"],
@@ -55,13 +59,18 @@ DEFAULT_TARGETS = {
 GT_CLASS_TO_CONCEPTS = {
     "chair": {"chair", "sofa"},
     "sofa": {"sofa", "chair"},
+    "stool": {"chair"},
+    "armchair": {"chair"},
     "table": {"desk"},
+    "desk": {"desk"},
     "desk-organizer": {"desk"},
     "panel": {"desk"},
     "bin": {"trash can"},
+    "basket": {"trash can"},
     "tissue-paper": {"trash can"},
     "tv-screen": {"computer monitor"},
     "tablet": {"computer monitor"},
+    "monitor": {"computer monitor"},
     "door": {"door"},
 }
 
