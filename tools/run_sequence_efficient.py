@@ -268,6 +268,7 @@ def main():
 
     # ---------------- 逐帧（进程内）----------------
     frame_records = []
+    no_depth_skipped = 0
     print(f"\n开始逐帧推理……\n")
     header = f"{'帧':>6} {'DINO':>9} {'SAM2':>9} {'提升':>9} {'合计':>9}  {'实例':>4}"
     print(header)
@@ -305,13 +306,28 @@ def main():
         # ---- 3D 提升（进程内）----
         sync(); t0 = time.perf_counter()
         geometries = []
-        for instance_mask in masks:
-            geometries.append(lift_mask_to_world(
-                rgb=rgb, depth_m=frame["depth_m"], mask=instance_mask.mask,
-                camera_matrix=frame["camera_matrix"],
-                camera_to_world=frame["camera_to_world"],
-                pixel_stride=args.pixel_stride, erosion_iterations=args.erosion_iterations,
-            ))
+        kept_detections = []
+        kept_masks = []
+        for detection, instance_mask in zip(detections, masks):
+            try:
+                geometry = lift_mask_to_world(
+                    rgb=rgb, depth_m=frame["depth_m"], mask=instance_mask.mask,
+                    camera_matrix=frame["camera_matrix"],
+                    camera_to_world=frame["camera_to_world"],
+                    pixel_stride=args.pixel_stride,
+                    erosion_iterations=args.erosion_iterations,
+                )
+            except ValueError:
+                # 掩码区域内没有有效深度（窗户/玻璃外的远景、反光面、超出量程的
+                # 平面）。扩展类别词表后会稳定遇到这类观测，不能让整条序列崩掉：
+                # 直接丢弃该观测，并保持 detections / masks / geometries 三者对齐。
+                no_depth_skipped += 1
+                continue
+            kept_detections.append(detection)
+            kept_masks.append(instance_mask)
+            geometries.append(geometry)
+        detections = kept_detections
+        masks = kept_masks
         sync(); stages["lift"] = (time.perf_counter() - t0) * 1000.0
 
         # ---- 合并单帧内的重复 / 过分割观测 ----
@@ -438,6 +454,9 @@ def main():
             indent=2,
         )
     print(f"延迟明细：{latency_path}")
+    if no_depth_skipped:
+        print(f"因掩码内无有效深度而丢弃的观测：{no_depth_skipped} 个"
+              f"（多为窗户/远景/反光面，扩展类别词表后会出现）")
 
     # ---------------- 关联 / 预览 / 融合（复用现有 finish_sequence）----------------
     # 把需要的属性挂到 args 上（finish_sequence 用到）

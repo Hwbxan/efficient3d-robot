@@ -21,6 +21,114 @@
 
 ---
 
+## 0.4 Demo A 需求定义（明确版）与逐条距离
+
+需求方明确的 Demo A 定义：
+
+> 输入**连续 8 个场景的 RGB + Depth + 相机位姿**，实现 **3D 实例感知 + 语义地图构建**；
+> 新场景输入进来也保持好效果；实时性好。
+
+**关键：位姿是输入，不是要我们估计的。** 因此 §5 的 **S3（接 SLAM）不在 Demo A 范围内**——
+这一条把整体距离从「1–2 月+」缩短到「周级」。逐条对照：
+
+| 需求条目 | 现状 | 距离 | 阻塞项 |
+|---|---|---|---|
+| 输入 RGB-D + 位姿 | 已支持（`ReplicaSequence` 读 `traj.txt`） | **0** | — |
+| 3D 实例感知 | 有，L1 级（单轨率 0.706） | 0（质量另计） | 掩码质量 AP@0.50 |
+| 语义地图构建 | 有（体素地图 + CLIP 可查询实例） | 0（但语义嵌入是离线的） | S1 |
+| **新场景泛化** | **⚠ 最大风险，见 §0.6** | **未知，正在测** | 类别封闭 |
+| 实时性好 | 191 ms/帧 = 5.2 fps（0.17× 实时） | 2–4 周 | S2 |
+| 真在线增量 | 算法因果，编排离线 | 1–2 周 | S1 |
+
+**结论**：位姿外给之后，剩下的硬骨头是 **「新场景泛化」和「实时性」**，
+而泛化这一条**比在线化更难**，且此前被 6 类封闭词表掩盖了。
+
+---
+
+## 0.6 ⚠ 泛化风险：检测词表只有 6 类，场景里却有 56 类
+
+```python
+# tools/run_multiscene_eval.py
+DEFAULT_PROMPTS = ["computer monitor", "chair", "desk", "trash can", "door", "sofa"]
+GT_CLASSES = [bin basket tissue-paper chair sofa stool armchair couch door
+              table desk desk-organizer tv-screen tablet monitor]   # 15 类
+```
+
+对 8 个场景的 `info_semantic.json` 做类别审计的结果：
+
+| 指标 | 数值 |
+|---|---|
+| 8 场景出现的语义类别总数 | **56** |
+| 不在当前 15 类 GT 白名单内的 | **43** |
+| 单场景类别数（office_3 / room_0） | 100 / 92 个标注物体 |
+
+高频但我们**根本不去检**的类别（出现次数）：
+`lamp` 36、`cushion` 18、`table` 16、`book` 10、`pillow` 9、`bottle` 6、
+`indoor-plant` 5、`clock` 4、`shelf`、`cabinet`、`nightstand` …
+
+**后果有两层，第二层更严重：**
+
+1. **能力缺口**：新场景若以灯、书架、床、柜、植物为主，系统直接哑火——
+   检测器拿到的文本提示里没有这些东西。
+2. **指标测不出缺口**：GT 评估白名单同样只有 15 类，检测端漏掉的 43 类
+   **完全不进入指标**。所以 headline 的 AP@0.50 = 0.519 是在一个小封闭世界里测的，
+   **不等于「换个场景也好」**。这是继 office_0/room_2 方差之后，指标虚高的第二个来源。
+
+**两条解法（二选一，代价不同）：**
+
+| 方案 | 做法 | 代价 | 风险 |
+|---|---|---|---|
+| **A 扩词表** | prompt 扩到 20–50 类 | 检测变慢（DINO text encoder 随词数增长）+ 误检上升 | 治标，仍受词表上限约束 |
+| **B 换架构** | 类别无关 proposal（SAM 自动掩码 / CropFormer）+ CLIP 后验打标签 | 要动 2D 前端，工作量大 | 治本，才是真开放词汇 |
+
+### 0.6.1 实测：20 类词表 vs 6 类词表（200 帧，同 GT，同权重）
+
+命令见 §7。结果：
+
+| 场景 | 词表 | AP@.25 | AP@.50 | P@.50 | R@.50 | GT 实例 | 预测 |
+|---|---|---|---|---|---|---|---|
+| office_0 | 6 类 | 0.583 | 0.334 | 0.722 | 0.503 | 1167 | 813 |
+| office_0 | **20 类** | **0.624** | **0.397** | 0.533 | **0.580** | 1442 | 1567 |
+| room_2 | 6 类 | 0.889 | **0.878** | 0.922 | 0.883 | 1065 | 1019 |
+| room_2 | **20 类** | 0.503 | **0.389** | 0.786 | 0.511 | 2968 | 1930 |
+
+延迟：191 → 215 ms/帧（+13%），检测 120 ms 基本不变（DINO-tiny 的 text encoder 不是瓶颈）。
+
+**怎么读这张表（两个场景符号相反，原因必须讲清）：**
+
+1. **office_0 上升**：GT 白名单只从 1167 涨到 1442（+275），而新增词表让它**真正检到了更多东西**，
+   召回 0.503 → 0.580，AP@0.50 0.334 → 0.397。这是实打实的能力增益。
+2. **room_2 暴跌**：GT 白名单从 1065 涨到 **2968（+1900）**——灯、书、枕头、植物、地毯
+   这些原本被排除在评估之外的物体**终于被算进来了**，系统检不到它们，召回 0.883 → 0.511。
+   **这不是系统变差，是把原本藏起来的缺口暴露了。**
+3. **所以 room_2 那个 0.878 是被严重高估的数字**——它只在 15 类封闭世界里成立。
+   按场景真实类别分布衡量，实际覆盖能力是 **0.39 这个量级**。
+4. **误检代价真实存在**：office_0 precision 0.722 → **0.533**，预测数 813 → 1567（近翻倍）。
+   对语义地图来说这是观感问题——**地图里大约每两个实例就有一个是假的**。
+
+**结论**：扩词表**可行且便宜**（延迟只 +13%，office_0 上 AP 还涨了），
+但它同时揭开了底：当前系统的真实开放词汇覆盖能力约 **AP@0.50 ≈ 0.39**，
+而 headline 的 0.519 是在封闭小世界里测的。要达到"新场景也好"，
+光扩词表不够——得同时压住误检（换更准的分割器 / 类别无关 proposal + CLIP 后验）。
+
+### 0.6.2 顺带修掉一个真实的泛化崩溃
+
+扩展词表后首次出现稳定崩溃：
+
+```
+ValueError: 实例掩码中没有有效深度      # src/geometry/instance_lifting.py
+```
+
+原因：新增类别（window / picture 等）会检到**窗户外的远景、玻璃、反光面**，
+这些区域深度无效，3D 提升直接抛异常，**整条序列中断**。
+6 类词表下永远不会遇到——**这就是"泛化"最典型的失败模式：新类别带来新崩溃。**
+
+修复：`tools/run_sequence_efficient.py` 主循环改为逐实例 try/except，
+丢弃无有效深度的观测，并保持 `detections / masks / geometries` 三者对齐，
+末尾打印丢弃计数。不影响 6 类 baseline（该分支从未触发）。
+
+---
+
 ## 0.5 Demo A 到底要什么：三种定义，三种距离
 
 上一版评估容易让人误解成「Demo A 还早」。其实取决于 Demo A 怎么定义——
@@ -135,6 +243,30 @@ self.camera_to_world = load_camera_poses(self.pose_path)
 **分水岭是 S3**。S1/S2 只是把已有的东西接对、跑快；
 S3 决定这套东西能不能离开数据集、上真机。在 S3 完成前，
 任何「在线」指标都是在 GT 轨迹上测的乐观值。
+
+---
+
+## 7. 复现：泛化实验
+
+```bash
+# 6 类 baseline（既有结果）
+python -m tools.run_multiscene_eval --all --real-only --skip-render \
+    --output-root outputs/multiscene_eval_v2
+
+# 20 类扩展词表（office_0 + room_2）
+python -m tools.run_multiscene_eval --scenes office_0 room_2 --skip-render \
+    --output-root outputs/ov_ab_p20 --dino-model checkpoints/grounding-dino-tiny \
+    --classes 'computer monitor' chair desk 'trash can' door sofa table bed lamp \
+              shelf cabinet book bottle cushion pillow 'potted plant' television \
+              window rug clock \
+    --gt-classes bin basket tissue-paper chair sofa stool armchair couch door \
+              table desk desk-organizer tv-screen tablet monitor bed lamp shelf \
+              cabinet book bottle cushion pillow indoor-plant window rug clock \
+              nightstand bench vase plate bowl box picture
+```
+
+注意两组**评估白名单不同**（15 类 vs 34 类），这不是严格同口径对比——
+差异本身就是实验要暴露的东西：白名单一放开，GT 实例数 room_2 从 1065 涨到 2968。
 
 ---
 
