@@ -38,6 +38,7 @@ import re
 import statistics
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import cv2
@@ -48,7 +49,14 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from src.datasets.replica_sequence import ReplicaSequence  # noqa: E402
-from src.geometry.instance_lifting import lift_mask_to_world  # noqa: E402
+from src.geometry.instance_lifting import (  # noqa: E402
+    lift_mask_to_world,
+    voxel_indices,
+)
+from src.geometry.instance_merging import (  # noqa: E402
+    plan_merges,
+    voxel_key_set,
+)
 from src.perception.grounding_dino_detector import GroundingDinoDetector  # noqa: E402
 from src.perception.sam2_box_segmenter import Sam2BoxSegmenter  # noqa: E402
 from tools.run_instance_sequence import finish_sequence  # noqa: E402
@@ -77,6 +85,81 @@ def save_point_cloud(output_path: Path, points: np.ndarray, colors: np.ndarray) 
 def sync() -> None:
     if torch.cuda.is_available():
         torch.cuda.synchronize()
+
+
+def merge_frame_instances(rgb, depth_m, camera_matrix, camera_to_world,
+                          detections, masks, geometries,
+                          voxel_size, coverage_threshold, max_center_distance,
+                          pixel_stride, erosion_iterations):
+    """把单帧内重复 / 过分割的观测合成一个，返回过滤后的三份列表。
+
+    做法：先用 3D 体素覆盖率找出应合并的下标组，把组内其余成员的 2D 掩码并到
+    代表上、检测框取并集、分数取最高，再对代表重新做一次 3D 提升，最后把被
+    吸收的成员从三份列表里剔除。重新提升是必须的——合并后的掩码比原来大，
+    沿用旧的质心 / 包围盒会让后续的关联与评估都基于一半的物体。
+    """
+
+    entries = []
+    for detection, geometry in zip(detections, geometries):
+        entries.append({
+            "label": detection.label,
+            "voxels": voxel_key_set(geometry.points_world, voxel_size),
+            "centroid": np.asarray(geometry.centroid, dtype=np.float64),
+        })
+
+    groups = plan_merges(entries, coverage_threshold, max_center_distance)
+    if not groups:
+        return detections, masks, geometries
+
+    # InstanceMask / Detection 都是 frozen dataclass，合并后要换成新对象
+    # 而不是改字段。
+    merged_masks = list(masks)
+    merged_detections = list(detections)
+    absorbed = set()
+    for group in groups:
+        keeper = group[0]
+        for index in group[1:]:
+            absorbed.add(index)
+            merged_masks[keeper] = replace(
+                merged_masks[keeper],
+                mask=np.logical_or(
+                    merged_masks[keeper].mask, merged_masks[index].mask
+                ),
+            )
+            keep_box = merged_detections[keeper].box_xyxy
+            other_box = merged_detections[index].box_xyxy
+            merged_detections[keeper] = replace(
+                merged_detections[keeper],
+                box_xyxy=np.concatenate([
+                    np.minimum(keep_box[:2], other_box[:2]),
+                    np.maximum(keep_box[2:], other_box[2:]),
+                ]),
+                score=max(
+                    merged_detections[keeper].score,
+                    merged_detections[index].score,
+                ),
+            )
+
+    merged_masks = [
+        replace(mask, area_pixels=int(np.count_nonzero(mask.mask)))
+        for mask in merged_masks
+    ]
+
+    merged_geometries = list(geometries)
+    for group in groups:
+        keeper = group[0]
+        merged_geometries[keeper] = lift_mask_to_world(
+            rgb=rgb, depth_m=depth_m, mask=merged_masks[keeper].mask,
+            camera_matrix=camera_matrix, camera_to_world=camera_to_world,
+            pixel_stride=pixel_stride, erosion_iterations=erosion_iterations,
+        )
+
+    kept = [index for index in range(len(detections)) if index not in absorbed]
+    return (
+        [merged_detections[index] for index in kept],
+        [merged_masks[index] for index in kept],
+        [merged_geometries[index] for index in kept],
+    )
 
 
 def make_autocast(enabled: bool):
@@ -108,6 +191,12 @@ def parse_arguments():
     parser.add_argument("--pixel-stride", type=int, default=2)
     parser.add_argument("--erosion-iterations", type=int, default=1)
     parser.add_argument("--voxel-size", type=float, default=0.02)
+    parser.add_argument("--voxel-assoc-size", type=float, default=0.05,
+                        help="跨帧关联用的体素边长（米）；0 表示不写 voxel_keys")
+    parser.add_argument("--merge-coverage", type=float, default=0.0,
+                        help="单帧内同标签观测体素覆盖率达到该值即合并；0 表示不合并（默认）")
+    parser.add_argument("--merge-max-center-distance", type=float, default=0.80,
+                        help="合并时额外的质心距离上限（米）")
     parser.add_argument("--encoder-weights", type=Path, default=None,
                         help="Stage-5 点式 encoder 权重（提供则提取 shape/clip 嵌入，增强关联）")
     parser.add_argument("--fp16", dest="fp16", action="store_true", default=True,
@@ -225,6 +314,20 @@ def main():
             ))
         sync(); stages["lift"] = (time.perf_counter() - t0) * 1000.0
 
+        # ---- 合并单帧内的重复 / 过分割观测 ----
+        if args.merge_coverage > 0 and len(geometries) > 1:
+            detections, masks, geometries = merge_frame_instances(
+                rgb=rgb, depth_m=frame["depth_m"],
+                camera_matrix=frame["camera_matrix"],
+                camera_to_world=frame["camera_to_world"],
+                detections=detections, masks=masks, geometries=geometries,
+                voxel_size=args.voxel_assoc_size,
+                coverage_threshold=args.merge_coverage,
+                max_center_distance=args.merge_max_center_distance,
+                pixel_stride=args.pixel_stride,
+                erosion_iterations=args.erosion_iterations,
+            )
+
         # ---- 写 segmentation 产物（与 inspect_grounded_sam2 一致）----
         name = f"frame_{frame_index:06d}"
         masks_directory = segmentation_root / f"{name}_masks"
@@ -269,6 +372,12 @@ def main():
                 "bbox_extent_m": geometry.bbox_extent.tolist(),
                 "point_cloud_path": str(ply_path),
             }
+            if args.voxel_assoc_size > 0:
+                # 跨帧关联用的体素索引：同一物体不同视角会落到几乎相同的体素
+                # 集合上，比质心距离稳得多（质心会随可见部分漂移）。
+                entry["voxel_keys"] = voxel_indices(
+                    geometry.points_world, args.voxel_assoc_size
+                ).tolist()
             if encoder is not None and len(geometry.points_world) >= 30:
                 emb = encode_single_instance(
                     encoder, points=geometry.points_world, colors=geometry.colors,

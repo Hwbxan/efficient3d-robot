@@ -1,3 +1,4 @@
+from collections import deque
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -24,6 +25,9 @@ class InstanceTrack:
     last_seen_frame: int
     observation_count: int = 1
     label_votes: dict = field(default_factory=dict)
+    # 最近若干次观测的体素并集，是跨帧关联的比较基准。
+    voxel_history: deque = field(default_factory=deque)
+    voxel_window: frozenset = field(default_factory=frozenset)
 
     @property
     def label(self):
@@ -52,6 +56,98 @@ def add_label_vote(track, observation):
         track.label_votes[label] = (
             track.label_votes.get(label, 0) + 1
         )
+
+
+def voxel_size_of(source):
+    """体素集合的元素个数，供调试输出使用；无数据时返回 0。"""
+
+    keys = voxel_set_of(source)
+    return 0 if keys is None else len(keys)
+
+
+def push_voxels(track, observation, window_size):
+    """把观测的体素压入轨道的滑动窗口，并重算窗口并集。
+
+    为什么用滑动窗口而不是「最后一次观测」或「累积并集」：
+
+    - 最后一次观测常常只是一块碎片（只看到椅背时可能只有 35 个体素，而完整
+      椅子有 190 个）。拿碎片做比较基准，覆盖率会随视角剧烈波动，同一物体
+      的配对也只有 0.16 左右的相似度，跟不同物体分不开。
+    - 累积并集虽然完整，但不可逆：一旦某次误匹配把远处物体并进来，它会越涨
+      越大（实测 room_2 有一条 chair 轨道涨到 924 体素），之后把越来越多的
+      无关观测「覆盖」进来，越错越多。
+
+    滑动窗口兼得两头：几次观测叠起来已经足够接近物体完整形状，而老观测会滑
+    出去，单次误匹配的影响只持续 window_size 帧。
+    """
+
+    keys = voxel_set_of(observation)
+    if keys is None:
+        return
+    if window_size <= 0:
+        return
+
+    while len(track.voxel_history) >= window_size:
+        track.voxel_history.popleft()
+    track.voxel_history.append(keys)
+
+    union = track.voxel_history[0]
+    for item in list(track.voxel_history)[1:]:
+        union = union | item
+    track.voxel_window = union
+
+
+def voxel_set_of(source):
+    """把观测（dict）或轨道（frozenset）统一成体素集合；无数据时返回 None。"""
+
+    if isinstance(source, (set, frozenset)):
+        return source if source else None
+
+    keys = source.get("voxel_keys")
+    if not keys:
+        return None
+    cached = source.get("_voxel_set")
+    if cached is None:
+        cached = frozenset(tuple(item) for item in keys)
+        source["_voxel_set"] = cached
+    return cached
+
+
+def voxel_scores(first, second, min_voxels=15):
+    """返回 (iou, coverage)：两个体素集合的 IoU 与覆盖率，无数据时 (None, None)。
+
+    较小的那一侧少于 min_voxels 时直接判定为不可信并返回 (None, None)：一块
+    只有几个体素的碎片随便落在谁身上都能拿到很高的覆盖率，让它参与判定等于
+    给噪声一票否决权。室内家具在 0.05 m 体素下完整形状通常有几百个体素，
+    15 的下限只挡碎片、不影响正常观测。
+
+    覆盖率 = |A∩B| / min(|A|,|B|)。为什么关联要用覆盖率而不是 IoU：跟踪时两个
+    集合常常一个是物体的完整体素、另一个只是当前视角下的一小块——只看到椅背
+    时可能只有 30 个体素，而完整椅子有 180 个。此时交集 29，IoU 只有 0.16，但
+    覆盖率高达 0.83：小块几乎完全落在大块里，这正是「同一个物体」的强证据。
+    实测同一物体的覆盖率在 0.7 以上，不同物体接近 0，间隔很干净。
+
+    覆盖率天然对称：小块对大块、大块对小块都会给出高值，所以比较对象用「最后
+    一次观测」就够了，不需要维护累积并集。实测累积并集反而有害——一旦某次误
+    匹配把远处物体并进来，并集会不可逆地膨胀（room_2 里有一条 chair 轨道的
+    并集涨到 924 体素，而一把椅子只有约 190），之后它会把越来越多的无关观测
+    「覆盖」进来，越错越多。
+    """
+
+    first_set = voxel_set_of(first)
+    second_set = voxel_set_of(second)
+    if first_set is None or second_set is None:
+        return None, None
+
+    intersection = len(first_set & second_set)
+    union = len(first_set | second_set)
+    if union == 0:
+        return None, None
+
+    smaller = min(len(first_set), len(second_set))
+    if smaller < min_voxels:
+        return None, None
+    return intersection / union, intersection / smaller
 
 
 def geometry_distances(first, second):
@@ -87,14 +183,19 @@ class GeometricInstanceTracker:
 
     def __init__(
         self,
-        max_center_distance=0.50,
-        max_bbox_gap=0.10,
-        unmatched_cost=0.65,
-        ambiguity_margin=0.08,
+        max_center_distance=0.65,
+        max_bbox_gap=0.15,
+        unmatched_cost=0.80,
+        ambiguity_margin=0.0,
         shape_weight=0.25,
         memory_frames=30,
         reacquire_max_center_distance=1.5,
         reacquire_max_bbox_gap=0.30,
+        voxel_iou_weight=0.70,
+        voxel_min_coverage=0.40,
+        reacquire_min_coverage=0.55,
+        voxel_memory_frames=600,
+        voxel_window_size=20,
     ):
         if max_center_distance <= 0 or max_bbox_gap <= 0:
             raise ValueError("距离门限必须大于 0")
@@ -103,9 +204,18 @@ class GeometricInstanceTracker:
         if reacquire_max_center_distance < max_center_distance:
             raise ValueError("reacquire_max_center_distance 必须 ≥ max_center_distance")
 
+        # 几何门限放得比直觉宽（0.65 m / 0.15 m）：判定物体身份的主力已经是体素
+        # 覆盖率，几何只是兜底。收紧几何门限反而会把「视角变化导致质心漂移」的
+        # 同一物体切成两条轨道，实测 room_2 上放宽后单轨率从 0.4 升到 0.7。
         self.max_center_distance = max_center_distance
         self.max_bbox_gap = max_bbox_gap
+        # 不匹配代价抬高到 0.80：让匈牙利匹配更愿意接受「勉强像」的配对，减少
+        # 被判为歧义而遭丢弃的检测（丢弃会直接损失召回率）。
         self.unmatched_cost = unmatched_cost
+        # 歧义余量为 0 表示不再因为「两个候选代价接近」而丢弃检测。原来的 0.08
+        # 本意是避免在拿不准时误合并，但实测它丢弃掉的多是真检测——覆盖率的分
+        # 布要么接近 0 要么很高，两个候选很容易并列，于是大量观测被判歧义后连轨
+        # 都不建。关掉之后 room_2 的召回率从 0.865 回到 0.896，AP 反超基线。
         self.ambiguity_margin = ambiguity_margin
         self.shape_weight = shape_weight
         # 重新捕获：物体短暂消失后重现时，相机已移动，其质心可能距旧轨最后
@@ -114,6 +224,20 @@ class GeometricInstanceTracker:
         self.memory_frames = memory_frames
         self.reacquire_max_center_distance = reacquire_max_center_distance
         self.reacquire_max_bbox_gap = reacquire_max_bbox_gap
+        # 体素覆盖率关联：权重为 0 时完全退回纯几何代价（旧行为）。
+        self.voxel_iou_weight = voxel_iou_weight
+        # 覆盖率达到该值即认定为同一物体，直接放行、不再受质心门限约束。
+        # 同一物体的实测覆盖率在 0.7 以上，不同物体接近 0，0.5 是很宽的间隔。
+        self.voxel_min_coverage = voxel_min_coverage
+        # 重新捕获专用的体素通道：几何重捕获只能用「近期」轨道，因为相机移动后
+        # 物体质心本来就会漂到门限外，放宽记忆窗口只会误合并；而体素覆盖不随
+        # 相机移动变化，几百帧之后依然是物体身份的可靠证据。所以给它一个独立
+        # 且长得多的记忆窗口，并要求更高的覆盖率（跨很久的重连比相邻帧更需要
+        # 证据充分，否则容易把物体搬走后又冒出来的同类物体认成同一个）。
+        self.reacquire_min_coverage = reacquire_min_coverage
+        self.voxel_memory_frames = voxel_memory_frames
+        # 比较基准取最近几次观测的体素并集的窗口长度。
+        self.voxel_window_size = voxel_window_size
 
         self.tracks = {}
         self.next_global_id = 1
@@ -131,17 +255,24 @@ class GeometricInstanceTracker:
         )
 
         add_label_vote(track, observation)
+        push_voxels(track, observation, self.voxel_window_size)
         self.tracks[global_id] = track
 
         return global_id
 
     def _gate(self, observation, track, frame_index=None):
-        """返回 (cost, max_center, max_bbox)。
+        """返回 (inf 或 None, max_center, max_bbox, voxel_coverage)。
 
         frame_index 为 None（或轨道近期未出现）时用严格门限；否则用放宽门限
         （重新捕获）。代价归一化随所用门限缩放，保证同一个移动量在放宽门限下
         代价更小、更易被重新捕获。
+
+        若覆盖率达到 voxel_min_coverage，直接放行：几何门限本来是为了拦住
+        「看着不像同一个东西」的配对，而「当前观测的体素几乎全部落在轨道已有
+        体素里」是更强的证据，再让质心门限否决它只会把同一物体切成多条轨道。
         """
+
+        _, coverage = voxel_scores(observation, track.voxel_window)
 
         center_distance, bbox_gap = geometry_distances(
             observation,
@@ -158,9 +289,12 @@ class GeometricInstanceTracker:
             max_center = self.max_center_distance
             max_bbox = self.max_bbox_gap
 
+        if coverage is not None and coverage >= self.voxel_min_coverage:
+            return None, max_center, max_bbox, coverage
+
         if center_distance > max_center or bbox_gap > max_bbox:
-            return np.inf, max_center, max_bbox
-        return None, max_center, max_bbox
+            return np.inf, max_center, max_bbox, coverage
+        return None, max_center, max_bbox, coverage
 
     def _label_penalty(self, observation, track):
         observed_label = observation["label"].strip().lower()
@@ -188,27 +322,42 @@ class GeometricInstanceTracker:
     def _association_cost(self, observation, track, frame_index=None):
         """严格门限的关联代价（第一遍匹配用）。"""
 
-        inf, max_center, max_bbox = self._gate(observation, track, frame_index)
+        inf, max_center, max_bbox, coverage = self._gate(
+            observation, track, frame_index
+        )
         if inf is not None:
             return inf
 
         label_penalty = self._label_penalty(observation, track)
         shape_cost, has_shape = self._shape_cost(observation, track)
+        center_distance, bbox_gap = geometry_distances(
+            observation, track.latest_observation
+        )
 
         if has_shape and self.shape_weight > 0.0:
             base = (
-                0.70 * geometry_distances(observation, track.latest_observation)[0] / max_center
-                + 0.20 * geometry_distances(observation, track.latest_observation)[1] / max_bbox
+                0.70 * center_distance / max_center
+                + 0.20 * bbox_gap / max_bbox
                 + 0.10 * label_penalty
             )
-            return (1.0 - self.shape_weight) * base + self.shape_weight * shape_cost
+            geometric = (
+                (1.0 - self.shape_weight) * base
+                + self.shape_weight * shape_cost
+            )
+        else:
+            geometric = (
+                0.70 * center_distance / max_center
+                + 0.20 * bbox_gap / max_bbox
+                + 0.10 * label_penalty
+            )
 
-        center_distance, bbox_gap = geometry_distances(observation, track.latest_observation)
-        return (
-            0.70 * center_distance / max_center
-            + 0.20 * bbox_gap / max_bbox
-            + 0.10 * label_penalty
-        )
+        if coverage is None or self.voxel_iou_weight <= 0.0:
+            return geometric
+
+        # 以覆盖率为主判据，几何只当平局裁决。不能用加权平均：覆盖率接近 0 时
+        # 加权平均会给出一个「比不匹配还差」的固定代价，把本来该由几何判定的
+        # 配对也一并否决掉（体素数据缺失时尤为明显）。
+        return (1.0 - coverage) + 0.10 * min(geometric, 1.0)
 
     def update(self, observations, frame_index):
         """返回当前帧局部 ID 到全局 ID 的关联结果。
@@ -302,6 +451,7 @@ class GeometricInstanceTracker:
                 track.last_seen_frame = frame_index
                 track.observation_count += 1
                 add_label_vote(track, observation)
+                push_voxels(track, observation, self.voxel_window_size)
                 matched_this_frame.add(track.global_id)
 
                 result.update(
@@ -331,9 +481,24 @@ class GeometricInstanceTracker:
                 if track.global_id in matched_this_frame:
                     continue
                 gap = frame_index - track.last_seen_frame
-                if gap < 0 or gap > self.memory_frames:
+                if gap < 0:
                     continue
-                cost = self._association_cost(observation, track, frame_index)
+                _, coverage = voxel_scores(
+                    observation, track.voxel_window
+                )
+                if (
+                    coverage is not None
+                    and coverage >= self.reacquire_min_coverage
+                    and gap <= self.voxel_memory_frames
+                ):
+                    # 体素通道：直接用覆盖率当代价，不看质心。
+                    cost = 1.0 - coverage
+                elif gap > self.memory_frames:
+                    continue
+                else:
+                    cost = self._association_cost(
+                        observation, track, frame_index
+                    )
                 if np.isfinite(cost) and cost < best_cost:
                     best_cost = cost
                     best_column = column
@@ -343,6 +508,7 @@ class GeometricInstanceTracker:
                 track.last_seen_frame = frame_index
                 track.observation_count += 1
                 add_label_vote(track, observation)
+                push_voxels(track, observation, self.voxel_window_size)
                 matched_this_frame.add(track.global_id)
                 results[row].update(
                     global_id=track.global_id,

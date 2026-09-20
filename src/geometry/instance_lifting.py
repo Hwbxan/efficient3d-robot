@@ -20,6 +20,20 @@ class InstancePointCloud3D:
     median_depth_m: float
 
 
+def voxel_indices(points_world, voxel_size=0.05):
+    """把实例点云量化成体素索引，去重后返回 (N, 3) 的整数数组。
+
+    跨帧实例关联用得上：世界坐标下把点量化成体素后，同一物体的不同视角会
+    落到几乎相同的体素集合上，而相邻的不同物体几乎不重叠。
+    """
+
+    points = np.asarray(points_world, dtype=np.float64)
+    if len(points) == 0:
+        return np.zeros((0, 3), dtype=np.int64)
+
+    return np.unique(np.floor(points / voxel_size).astype(np.int64), axis=0)
+
+
 def lift_mask_to_world(
     rgb: np.ndarray,
     depth_m: np.ndarray,

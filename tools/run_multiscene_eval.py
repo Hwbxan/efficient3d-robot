@@ -125,6 +125,9 @@ def main():
     parser.add_argument("--text-threshold", type=float, default=0.20)
     parser.add_argument("--max-box-area-fraction", type=float, default=0.40)
     parser.add_argument("--voxel-size", type=float, default=0.02)
+    parser.add_argument("--merge-coverage", type=float, default=0.0,
+                        help="单帧内同标签观测体素覆盖率达到该值即合并；0 表示不合并（默认）")
+    parser.add_argument("--merge-max-center-distance", type=float, default=0.80)
     parser.add_argument("--no-fp16", action="store_true",
                         help="2D 前端用 fp32（默认 fp16，更快且精度基本无损）")
     parser.add_argument("--max-area-fraction", type=float, default=0.40,
@@ -252,7 +255,10 @@ def main():
                  "--box-threshold", str(args.box_threshold),
                  "--text-threshold", str(args.text_threshold),
                  "--max-box-area-fraction", str(args.max_box_area_fraction),
-                 "--voxel-size", str(args.voxel_size)]
+                 "--voxel-size", str(args.voxel_size),
+                 "--merge-coverage", str(args.merge_coverage),
+                 "--merge-max-center-distance",
+                 str(args.merge_max_center_distance)]
                 + (["--no-fp16"] if args.no_fp16 else []),
                 run_directory / "logs" / "run.log",
                 f"在线推理 {scene}（{len(eval_frames)} 帧）",
