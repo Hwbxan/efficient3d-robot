@@ -418,7 +418,26 @@ python -m tools.build_selfcontained_viewer
 > 而沙箱里的 `localhost:8137` 只在沙箱内部可达，外部浏览器访问不到。
 > 因此对外交付一律用第 3 步的**自包含单文件**。
 
-### 2. 实时建图短视频（mp4）
+### 2. 相机第一视角感知视频（mp4，主视频）
+
+`tools/make_egocentric_video.py` 渲染**相机自己看到的画面**：跟随相机移动，画面中
+被识别出的物体用跨帧稳定的颜色描出轮廓并标注类别名称（`sofa #13`），实例首次被
+确认时打上 **★ NEW**，左下角面板按出现顺序累积列出「已发现物体」——
+
+```
+python -m tools.make_egocentric_video --scene office_0 --max-frames 200 \
+    --fps 20 --out outputs/demo_video
+```
+
+产出 `outputs/demo_video/office_0_ego.mp4`（1200×680 / 20fps / 10 秒，19 个实例）。
+数据来自逐帧分割 `frame_*_instances.json` 与跨帧关联 `association/tracking.json`
+（用 `global_id` 保证同一物体的名称与颜色全程稳定）。掩码默认**只描边不填充**：
+逐帧掩码是多边形近似，填充会盖住真实画面（`--mask-alpha 0.35` 可恢复填充）。
+
+### 3. 3D 地图视角短视频（mp4）
+
+> 这是另一种视角：绕 3D 地图旋转的点云视频，用于展示地图整体形态，
+> 与上面第一视角视频互补。
 
 `tools/make_demo_video.py` 用 matplotlib 离屏渲染一段「逐步建图 + 文本查询高亮」视频
 （默认 office_0，查询 `chair`）：**1280×720 / 15fps / 8 秒**，前 70% 按 `first_seen_frame`
@@ -433,7 +452,7 @@ python -m tools.build_selfcontained_viewer
     --data outputs/demo_a_data --scene office_0 --query chair --frames 120
 ```
 
-### 3. 关于换更强开放词汇检测器
+### 4. 关于换更强开放词汇检测器
 
 在 office_1 上实测了 **Grounding DINO base**（可用的最强本地权重）对比 tiny：
 几何 AP@.25/AP@.50、碎片率、标签一致性**与 tiny 完全一致**，显示器聚类仍是 2 个，
