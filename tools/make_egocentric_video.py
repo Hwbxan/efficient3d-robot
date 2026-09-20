@@ -2,8 +2,14 @@
 
 与 make_demo_video.py（绕场景旋转的上帝视角点云）不同，这里渲染的是
 **相机自己看到的画面**：跟随相机移动，画面里被识别出的物体用跨帧稳定的颜色
-叠加掩码高亮，并在框上标出类别名称；某个实例首次被确认时打上 ★NEW 高亮，
+**在物体区域内柔和点亮**（不画检测矩形框、不画轮廓描边，底图纹理完全保留），
+中心标一行无框文字标签；某个实例首次被确认时高亮更亮并打上 ★NEW，
 左下角面板按时间累积列出「已发现物体」，直观呈现在线建图/识别逐步增长的过程。
+
+三种绘制样式（`--style`）：
+  highlight（默认）柔和填充高亮，无框无描边
+  outline            掩码轮廓描边
+  box                传统检测矩形框 + 标签底色条
 
 数据来源：
   RGB         datasets/processed/Replica/<scene>/results/frame%06d.jpg
@@ -20,6 +26,7 @@ import json
 import subprocess
 from pathlib import Path
 
+import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 PALETTE = [
@@ -65,6 +72,27 @@ def hexless(idx: int):
     return PALETTE[idx % len(PALETTE)]
 
 
+def soften(color, mix: float = 0.32):
+    """把调色板颜色朝白色混合，得到柔和的「发光」高亮色。
+
+    直接铺原色会让画面像被色块糊住；混白后叠加在真实影像上，
+    既能看清物体范围，又保留底图纹理。
+    """
+    return tuple(int(c + (255 - c) * mix) for c in color)
+
+
+def mask_centroid(mask: Image.Image, box, width, height):
+    """掩码内像素坐标的中位数（比均值稳，凹形/多块掩码也不会跑出物体外）。"""
+    arr = np.asarray(mask)
+    ys, xs = np.nonzero(arr > 128)
+    if len(xs) == 0:
+        x1, y1, x2, y2 = box
+        return int((x1 + x2) / 2), int((y1 + y2) / 2)
+    cx = int(np.median(xs))
+    cy = int(np.median(ys))
+    return min(max(cx, 0), width - 1), min(max(cy, 0), height - 1)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--scene", default="office_0")
@@ -74,12 +102,18 @@ def main():
     ap.add_argument("--fps", type=int, default=20)
     ap.add_argument("--scale", type=int, default=1,
                     help="输出放大倍数；原始帧已是 1200x680，默认 1 不放大")
+    ap.add_argument("--style", default="highlight",
+                    choices=["highlight", "outline", "box"],
+                    help="highlight=柔和填充高亮，无框无描边（默认）；"
+                         "outline=掩码轮廓描边；box=检测矩形框")
     ap.add_argument("--mask-alpha", type=float, default=0.0,
-                    help="掩码填充透明度，0 表示不填充（默认，保留真实画面）")
-    ap.add_argument("--mask-outline", type=int, default=1,
-                    help="是否绘制掩码轮廓（1 开 / 0 关）")
+                    help="outline/box 样式下的掩码填充透明度，0 表示不填充")
+    ap.add_argument("--fill-alpha", type=float, default=0.38,
+                    help="highlight 样式的填充强度（0–1）")
+    ap.add_argument("--label-mode", default="text", choices=["text", "none"],
+                    help="text=在物体中心画无框文字标签；none=完全不画文字")
     ap.add_argument("--outline-width", type=int, default=3,
-                    help="轮廓粗细（像素，作用于原始分辨率）")
+                    help="outline 样式的轮廓粗细（像素）")
     ap.add_argument("--new-frames", type=int, default=12,
                     help="首次出现后多少帧内仍标记为 NEW")
     ap.add_argument("--out", default="outputs/demo_video")
@@ -140,26 +174,40 @@ def main():
             first_seen = track.get("first_seen_frame", frame_index)
             is_new = (frame_index - first_seen) <= args.new_frames
 
-            # 掩码处理：默认只描边不填充。
-            # 逐帧检测掩码是粗糙的多边形近似，直接填充会盖住真实画面、观感很糊；
-            # 描边既能清楚指出物体轮廓又保留原始影像（--mask-alpha >0 可恢复填充）。
+            # 掩码处理：默认 highlight —— 只在物体区域内叠一层柔和的半透明色，
+            # 不画矩形检测框、不画轮廓线，纯粹「把物体点亮」，底图纹理完全保留。
             mask_path = inst.get("mask_path")
+            mask = None
             if mask_path and Path(mask_path).exists():
                 try:
                     mask = Image.open(mask_path).convert("L")
                     if mask.size != image.size:
                         mask = mask.resize(image.size)
+                except Exception:
+                    mask = None
 
+            x1, y1, x2, y2 = inst["box_xyxy"]
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(width - 1, x2), min(height - 1, y2)
+
+            if mask is not None:
+                if args.style == "highlight":
+                    # 刚被确认的实例更亮一点，便于看清「新发现」的瞬间
+                    a = args.fill_alpha * (1.45 if is_new else 1.0)
+                    a = float(min(a, 0.85))
+                    alpha = mask.point(lambda v: int(v * a))
+                    tint = Image.new("RGBA", image.size, soften(color) + (0,))
+                    tint.putalpha(alpha)
+                    base = Image.alpha_composite(base, tint)
+                else:
                     if args.mask_alpha > 0:
                         alpha = mask.point(lambda v: int(v * args.mask_alpha))
                         tint = Image.new("RGBA", image.size, color + (0,))
                         tint.putalpha(alpha)
                         base = Image.alpha_composite(base, tint)
-
-                    if args.mask_outline:
+                    if args.style == "outline":
                         # 形态学梯度 = 膨胀 - 腐蚀，得到掩码边缘轮廓
                         from PIL import ImageFilter
-                        import numpy as np
                         k = args.outline_width
                         dilated = np.asarray(
                             mask.filter(ImageFilter.MaxFilter(2 * k + 1)),
@@ -171,25 +219,34 @@ def main():
                         line = Image.new("RGBA", image.size, color + (0,))
                         line.putalpha(Image.fromarray(edge, mode="L"))
                         base = Image.alpha_composite(base, line)
-                except Exception:
-                    pass
 
-            x1, y1, x2, y2 = inst["box_xyxy"]
-            x1, y1 = max(0, x1), max(0, y1)
-            x2, y2 = min(width - 1, x2), min(height - 1, y2)
-            draw.rectangle([x1, y1, x2, y2], outline=color + (255,),
-                           width=4 if is_new else 2)
+            if args.style == "box":
+                draw.rectangle([x1, y1, x2, y2], outline=color + (255,),
+                               width=4 if is_new else 2)
 
-            text = f"{label} #{gid}"
-            if is_new:
-                text = "★ NEW · " + text
-            box = draw.textbbox((0, 0), text, font=font)
-            tw, th = box[2] - box[0], box[3] - box[1]
-            ty = max(0, y1 - th - 6)
-            draw.rectangle([x1, ty, x1 + tw + 10, ty + th + 6],
-                           fill=color + (235,))
-            draw.text((x1 + 5, ty + 3), text, font=font,
-                      fill=(15, 15, 15, 255))
+            if args.label_mode == "text":
+                text = f"{label} #{gid}"
+                if is_new:
+                    text = "★ NEW · " + text
+                box = draw.textbbox((0, 0), text, font=font)
+                tw, th = box[2] - box[0], box[3] - box[1]
+                if args.style == "box":
+                    ty = max(0, y1 - th - 6)
+                    draw.rectangle([x1, ty, x1 + tw + 10, ty + th + 6],
+                                   fill=color + (235,))
+                    draw.text((x1 + 5, ty + 3), text, font=font,
+                              fill=(15, 15, 15, 255))
+                else:
+                    # 无框标签：放在物体中心，黑描边保证在任何底色上都可读
+                    if mask is not None:
+                        cx, cy = mask_centroid(mask, (x1, y1, x2, y2),
+                                               width, height)
+                    else:
+                        cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+                    tx = min(max(cx - tw // 2, 2), width - tw - 2)
+                    ty = min(max(cy - th // 2, 2), height - th - 2)
+                    draw.text((tx, ty), text, font=font, fill=(255, 255, 255, 255),
+                              stroke_width=3, stroke_fill=(0, 0, 0, 255))
 
             if gid not in seen_gids:
                 seen_gids.add(gid)

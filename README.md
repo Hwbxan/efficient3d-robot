@@ -421,15 +421,22 @@ python -m tools.build_selfcontained_viewer
 ### 2. 相机第一视角感知视频（mp4，主视频）
 
 `tools/make_egocentric_video.py` 渲染**相机自己看到的画面**：跟随相机移动，画面中
-被识别出的物体用跨帧稳定的颜色描出轮廓并标注类别名称（`sofa #13`），实例首次被
-确认时打上 **★ NEW**，左下角面板按出现顺序累积列出「已发现物体」——
+被识别出的物体**在物体区域内被柔和点亮**——默认**不画检测矩形框、不画轮廓线**，
+只在 SAM2 掩码覆盖的区域内叠一层半透明色（调色板颜色朝白混 32%，避免盖糊底图），
+底图纹理完整保留；名称以**无边框文字**压在物体中心。实例首次被确认时高亮加重并打上
+**★ NEW**，左下角面板按出现顺序累积列出「已发现物体」——
 
 ```
 python -m tools.make_egocentric_video --scene office_0 --max-frames 200 \
     --fps 20 --out outputs/demo_video
 ```
 
-产出 `outputs/demo_video/office_0_ego.mp4`（1200×680 / 20fps / 10 秒，19 个实例）。
+产出 `outputs/demo_video/office_0_ego.mp4`。
+
+> 早期版本画的是检测矩形框 + 轮廓描边，观感杂乱且框回归不准会误导视线；
+> 现已改为纯区域高亮。三种样式由 `--style` 切换：
+> `highlight`（默认，柔和填充，无框无描边）/ `outline`（掩码轮廓）/ `box`（传统矩形框）；
+> `--label-mode none` 可完全去掉文字，`--fill-alpha` 调节高亮强度。
 
 > **要流畅视频必须用连续帧。** 正式评测为省算力把检测+SAM2 的步长设成 10
 > （`--frame-stride 10`），直接拿这些帧拼视频会明显跳动。用步长 1 重跑同一场景即可
@@ -444,8 +451,9 @@ python -m tools.make_egocentric_video --scene office_0 --max-frames 200 \
 >     --out outputs/demo_video_dense
 > ```
 数据来自逐帧分割 `frame_*_instances.json` 与跨帧关联 `association/tracking.json`
-（用 `global_id` 保证同一物体的名称与颜色全程稳定）。掩码默认**只描边不填充**：
-逐帧掩码是多边形近似，填充会盖住真实画面（`--mask-alpha 0.35` 可恢复填充）。
+（用 `global_id` 保证同一物体的名称与颜色全程稳定）。最终交付片为该配置产物：
+**1200×680 / 24fps / 10 秒 / 15 个实例**，位于线上站点与
+`demo_a/demo_a_office_0_egocentric.mp4`。
 
 ### 3. 3D 地图视角短视频（mp4）
 
@@ -465,7 +473,22 @@ python -m tools.make_egocentric_video --scene office_0 --max-frames 200 \
     --data outputs/demo_a_data --scene office_0 --query chair --frames 120
 ```
 
-### 4. 关于换更强开放词汇检测器
+### 4. 在线分享站点（公网链接）
+
+交付物已部署为一个静态站点，浏览器直接打开即可，**不需要本地起服务**：
+
+<https://ae5090cec23bd76a0.app.workbuddy.host>
+
+| 路径 | 内容 |
+|---|---|
+| `/` | 相机第一视角视频页（内嵌播放 + 说明 + 已知缺陷） |
+| `/viewer.html` | 8 场景 3D 交互地图（自包含，Three.js 与数据全部内联） |
+| `/demo_a_office_0_egocentric.mp4` | 原视频下载（1200×680 / 24fps / 10s） |
+
+> 沙箱内的 `localhost:8137` 只在沙箱内部可达，外部浏览器打不开——对外一律用公网链接
+> 或第 1 步的自包含单文件。
+
+### 5. 关于换更强开放词汇检测器
 
 在 office_1 上实测了 **Grounding DINO base**（可用的最强本地权重）对比 tiny：
 几何 AP@.25/AP@.50、碎片率、标签一致性**与 tiny 完全一致**，显示器聚类仍是 2 个，
