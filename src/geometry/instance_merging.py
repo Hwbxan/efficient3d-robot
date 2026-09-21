@@ -58,7 +58,8 @@ def set_coverage(first, second):
     return len(first & second) / smaller
 
 
-def plan_merges(entries, iou_threshold, max_center_distance=0.0):
+def plan_merges(entries, iou_threshold, max_center_distance=0.0,
+                allow_cross_label=False, known_labels=None):
     """把应合并的下标分到同一组。
 
     entries: [{"label": str, "voxels": frozenset, "centroid": array-like}, ...]
@@ -67,9 +68,17 @@ def plan_merges(entries, iou_threshold, max_center_distance=0.0):
 
     判定用覆盖率：两个碎片谁大谁小不影响结论，只要小的几乎完整落在大的里面
     就该合并。
+
+    allow_cross_label=True 时允许不同标签的观测合并（用于「desk / table」这类
+    同义提示词把同一物体检出两遍的情况）。安全性来自判据本身：3D 体素覆盖率
+    高意味着两者占了同一批体素，而两个**不同**物体在 3D 上几乎不共享体素。
+    known_labels 给出时只允许白名单内的标签参与跨标签合并，避免把检测器偶尔
+    给出的杂标签并进正常实例。
     """
 
     count = len(entries)
+    if known_labels is not None:
+        known_labels = set(known_labels)
     parent = list(range(count))
 
     def find(node):
@@ -86,8 +95,15 @@ def plan_merges(entries, iou_threshold, max_center_distance=0.0):
 
     for i in range(count):
         for j in range(i + 1, count):
-            if entries[i]["label"] != entries[j]["label"]:
-                continue
+            same_label = entries[i]["label"] == entries[j]["label"]
+            if not same_label:
+                if not allow_cross_label:
+                    continue
+                if known_labels is not None and not (
+                    entries[i]["label"] in known_labels
+                    and entries[j]["label"] in known_labels
+                ):
+                    continue
             if set_coverage(
                 entries[i]["voxels"], entries[j]["voxels"]
             ) < iou_threshold:

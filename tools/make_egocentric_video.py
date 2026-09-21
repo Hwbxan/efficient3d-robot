@@ -116,6 +116,7 @@ def main():
                     help="outline 样式的轮廓粗细（像素）")
     ap.add_argument("--new-frames", type=int, default=12,
                     help="首次出现后多少帧内仍标记为 NEW")
+    ap.add_argument("--bitrate", default="2.5M", help="视频码率，默认 2.5M")
     ap.add_argument("--out", default="outputs/demo_video")
     args = ap.parse_args()
 
@@ -245,8 +246,17 @@ def main():
                         cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
                     tx = min(max(cx - tw // 2, 2), width - tw - 2)
                     ty = min(max(cy - th // 2, 2), height - th - 2)
+                    # 先铺一层半透明深色底衬：场景里有大量暗区与高亮屏幕，
+                    # 只靠描边的白字在白色屏幕上几乎不可读。
+                    pad = 5
+                    plate = Image.new("RGBA", (tw + 2 * pad, th + 2 * pad),
+                                      (0, 0, 0, 150))
+                    # 底衬与文字都画在 overlay 上（高亮走的是 base），
+                    # 最后 overlay 统一叠到 base 上。
+                    overlay.alpha_composite(plate, (max(tx - pad, 0),
+                                                    max(ty - pad, 0)))
                     draw.text((tx, ty), text, font=font, fill=(255, 255, 255, 255),
-                              stroke_width=3, stroke_fill=(0, 0, 0, 255))
+                              stroke_width=2, stroke_fill=(0, 0, 0, 255))
 
             if gid not in seen_gids:
                 seen_gids.add(gid)
@@ -287,8 +297,9 @@ def main():
 
     print("合成 mp4 ...")
     mp4 = out_dir / f"{args.scene}_ego.mp4"
-    candidates = [("libopenh264", ["-b:v", "6M"]),
-                  ("h264_nvenc", ["-b:v", "6M"]),
+    br = args.bitrate
+    candidates = [("libopenh264", ["-b:v", br]),
+                  ("h264_nvenc", ["-b:v", br]),
                   ("mpeg4", ["-q:v", "4"])]
     ok = False
     for enc, extra in candidates:

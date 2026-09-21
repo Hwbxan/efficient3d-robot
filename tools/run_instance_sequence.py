@@ -161,8 +161,12 @@ def finish_sequence(args, run_directory):
     tracking_done = run_directory / "progress/tracking.json"
     if not tracking_done.is_file():
         tracking_path.parent.mkdir(parents=True, exist_ok=True)
+        # PATCH_LABEL_GATE_V1
+        mode = getattr(args, "label_gate", "off") or "off"
+        gate = [] if str(mode) == "off" else ["--label-gate", str(mode)]
         run_module("tools.inspect_instance_tracking", [
             "--instances-root", instances, "--frames", *args.frames, "--output", tracking_path,
+            "--classes", *args.classes, *gate,
         ], run_directory / "logs/tracking.log")
         tracking = load_json(tracking_path)
         if [item["frame_index"] for item in tracking["frames"]] != args.frames:
@@ -171,7 +175,9 @@ def finish_sequence(args, run_directory):
 
     preview_directory = run_directory / "tracking_preview"
     preview_done = run_directory / "progress/preview.json"
-    if not preview_done.is_file():
+    if getattr(args, "no_preview", False):
+        print("[跳过] 关联预览（--no-preview）")
+    elif not preview_done.is_file():
         run_module("tools.preview_instance_tracking", [
             "--scene-directory", args.scene_directory, "--tracking-json", tracking_path,
             "--mask-directory", run_directory / "segmentation", "--output-directory", preview_directory,
@@ -181,7 +187,9 @@ def finish_sequence(args, run_directory):
         save_json(preview_done, {"path": str(preview_directory)})
 
     fusion_done = run_directory / "progress/fusion.json"
-    if not fusion_done.is_file():
+    if getattr(args, "no_fusion", False):
+        print("[跳过] 实例融合（--no-fusion）")
+    elif not fusion_done.is_file():
         # 融合脚本拒绝覆盖目录；若上次中断，保留失败输出并使用新尝试目录。
         attempt = 1
         while (run_directory / f"fusion_attempt_{attempt:02d}").exists():
@@ -196,6 +204,8 @@ def finish_sequence(args, run_directory):
             raise ValueError("融合输出的帧列表与本次实验不一致")
         save_json(fusion_done, {"path": str(fusion_directory)})
 
+    if getattr(args, "no_fusion", False):
+        return
     fusion_directory = Path(load_json(fusion_done)["path"])
     tracking = load_json(tracking_path)
     decisions = {}

@@ -37,6 +37,9 @@ def parse_arguments():
     parser.add_argument("--context-ratio", type=float, default=0.10, help="裁剪框外扩比例")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--device", default=None)
+    parser.add_argument("--classes-file", default=None,
+                        help="JSON 列表或 [[组...],...]，提供类别短语；"
+                             "给出后启用逐 crop 投票与精炼嵌入")
     return parser.parse_args()
 
 
@@ -129,6 +132,19 @@ def main():
     output_directory = Path(args.output_directory)
     output_directory.mkdir(parents=True, exist_ok=True)
 
+    # PATCH_CLIP_VOTE_V1：加载类别短语表
+    class_names = []
+    if args.classes_file:
+        data = json.loads(Path(args.classes_file).read_text(encoding="utf-8"))
+        if data and isinstance(data[0], list):
+            for group in data:
+                for c in group:
+                    if c not in class_names:
+                        class_names.append(c)
+        else:
+            class_names = list(data)
+        print("类别短语 %d 个，启用逐 crop 投票" % len(class_names))
+
     records, used_frames, fused_labels, skipped_small = collect_crops(args, run_directory)
     if not records:
         raise RuntimeError("没有收集到任何实例裁剪图")
@@ -149,16 +165,50 @@ def main():
         accumulator[global_id] += vector * area
         pixel_area[global_id] += area
 
+    # PATCH_CLIP_VOTE_V1：逐 crop 投票 + 只聚合投给多数类的 crop
+    vote_label = {}
+    vote_hist = {}
+    refined = {}
+    refined_area = {}
+    if class_names:
+        text = encoder.encode_texts(["a photo of a %s" % c for c in class_names])
+        text = np.asarray(text, dtype=np.float32).reshape(len(class_names), -1)
+        text = text / np.maximum(np.linalg.norm(text, axis=1, keepdims=True), 1e-8)
+        feats = np.asarray(features, dtype=np.float32)
+        feats = feats / np.maximum(np.linalg.norm(feats, axis=1, keepdims=True), 1e-8)
+        sims = feats @ text.T                       # (n_crop, n_class)
+        top = np.argmax(sims, axis=1)
+        for (global_id, _, area), k in zip(records, top):
+            hist = vote_hist.setdefault(global_id, {})
+            hist[class_names[int(k)]] = hist.get(class_names[int(k)], 0.0) + area
+        for gid, hist in vote_hist.items():
+            vote_label[gid] = max(hist.items(), key=lambda kv: kv[1])[0]
+        for (global_id, _, area), vector, k in zip(records, features, top):
+            if class_names[int(k)] != vote_label.get(global_id):
+                continue
+            if global_id not in refined:
+                refined[global_id] = np.zeros_like(vector)
+                refined_area[global_id] = 0.0
+            refined[global_id] += vector * area
+            refined_area[global_id] += area
+        print("投票完成：%d 个实例；精炼嵌入覆盖 %d 个"
+              % (len(vote_label), len(refined)))
+
     global_ids = sorted(accumulator)
     embeddings = np.stack([accumulator[g] for g in global_ids])
     norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
     embeddings = embeddings / np.maximum(norms, 1e-8)
 
-    np.savez(
-        output_directory / "instance_embeddings.npz",
+    # PATCH_CLIP_VOTE_V1：原始嵌入 + 精炼嵌入一起存
+    save_kwargs = dict(
         global_ids=np.asarray(global_ids, dtype=np.int64),
         embeddings=embeddings.astype(np.float32),
     )
+    if refined:
+        ref = np.stack([refined.get(g, accumulator[g]) for g in global_ids])
+        ref = ref / np.maximum(np.linalg.norm(ref, axis=1, keepdims=True), 1e-8)
+        save_kwargs["embeddings_refined"] = ref.astype(np.float32)
+    np.savez(output_directory / "instance_embeddings.npz", **save_kwargs)
 
     metadata = {
         "clip_model": args.clip_model,
@@ -175,6 +225,11 @@ def main():
                 "crops_used": len(used_frames[global_id]),
                 "pixel_area": int(pixel_area[global_id]),
                 "frames": used_frames[global_id],
+                # PATCH_CLIP_VOTE_V1
+                "clip_label": vote_label.get(global_id),
+                "clip_votes": {k: int(v) for k, v in sorted(
+                    (vote_hist.get(global_id) or {}).items(),
+                    key=lambda kv: -kv[1])[:5]},
             }
             for global_id in global_ids
         ],

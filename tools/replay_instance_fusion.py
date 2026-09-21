@@ -32,10 +32,16 @@ def instance_color(global_id):
     return np.array(hsv_to_rgb(hue, 0.75, 1.0))
 
 
-def read_cloud(path):
+ALLOW_MISSING_CLOUD = True
+
+
+def read_cloud(path, allow_missing=None):
     import open3d as o3d
 
+    allow = ALLOW_MISSING_CLOUD if allow_missing is None else allow_missing
     if not path.is_file():
+        if allow:
+            return None, None
         raise FileNotFoundError(f"找不到实例点云：{path}")
 
     cloud = o3d.io.read_point_cloud(str(path))
@@ -68,6 +74,7 @@ def replay_frames(tracking, instances_root, voxel_size):
     frame_indices = [frame["frame_index"] for frame in frames]
     if not frames or any(b <= a for a, b in zip(frame_indices, frame_indices[1:])):
         raise ValueError("关联记录必须非空，且帧编号严格递增")
+    missing_cloud_count = 0
 
     instance_maps = {}
     source_frames = {}
@@ -109,6 +116,11 @@ def replay_frames(tracking, instances_root, voxel_size):
 
             observation = by_local_id[local_id]
             points, colors = read_cloud(project_path(observation["point_cloud_path"]))
+            if points is None:
+                # 该观测来自几何传播帧（未做 3D 提升、无独立点云），跳过融合。
+                missing_cloud_count += 1
+                print(f"  Local {local_id:02d} → G{global_id:03d} | 传播帧，无独立点云，跳过")
+                continue
 
             if global_id not in instance_maps:
                 instance_maps[global_id] = OnlineVoxelMap(voxel_size)

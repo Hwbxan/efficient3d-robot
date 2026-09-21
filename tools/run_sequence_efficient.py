@@ -39,6 +39,7 @@ import statistics
 import sys
 import time
 from dataclasses import replace
+from dataclasses import replace as _dc_replace
 from pathlib import Path
 
 import cv2
@@ -57,8 +58,20 @@ from src.geometry.instance_merging import (  # noqa: E402
     plan_merges,
     voxel_key_set,
 )
-from src.perception.grounding_dino_detector import GroundingDinoDetector  # noqa: E402
-from src.perception.sam2_box_segmenter import Sam2BoxSegmenter  # noqa: E402
+from src.mapping import geometric_instance_tracker as _git  # noqa: E402
+from src.geometry.mask_propagation import (  # noqa: E402
+    densify_label_map,
+    propagate_instance_masks,
+    visible_pixel_counts,
+)
+from src.perception.grounding_dino_detector import (  # noqa: E402
+    Detection,
+    GroundingDinoDetector,
+)
+from src.perception.sam2_box_segmenter import (  # noqa: E402
+    InstanceMask,
+    Sam2BoxSegmenter,
+)
 from tools.run_instance_sequence import finish_sequence  # noqa: E402
 
 MASK_COLORS_RGB = [
@@ -87,10 +100,28 @@ def sync() -> None:
         torch.cuda.synchronize()
 
 
+def nms_detections(detections, iou_threshold=0.60):
+    """跨提示词组 NMS：不同组可能把同一物体用不同标签检出两遍。
+
+    按分数降序贪心保留，IoU 超过阈值的弱框丢弃。返回保留的检测列表。
+    """
+    if len(detections) <= 1:
+        return list(detections)
+    import torch
+    from torchvision.ops import nms as _nms
+    boxes = torch.as_tensor(
+        np.stack([np.asarray(d.box_xyxy, dtype=np.float32) for d in detections]))
+    scores = torch.as_tensor(
+        np.asarray([float(d.score) for d in detections], dtype=np.float32))
+    keep = _nms(boxes, scores, float(iou_threshold)).cpu().numpy().tolist()
+    return [detections[i] for i in keep]
+
+
 def merge_frame_instances(rgb, depth_m, camera_matrix, camera_to_world,
                           detections, masks, geometries,
                           voxel_size, coverage_threshold, max_center_distance,
-                          pixel_stride, erosion_iterations):
+                          pixel_stride, erosion_iterations,
+                          allow_cross_label=False, known_labels=None):
     """把单帧内重复 / 过分割的观测合成一个，返回过滤后的三份列表。
 
     做法：先用 3D 体素覆盖率找出应合并的下标组，把组内其余成员的 2D 掩码并到
@@ -107,7 +138,9 @@ def merge_frame_instances(rgb, depth_m, camera_matrix, camera_to_world,
             "centroid": np.asarray(geometry.centroid, dtype=np.float64),
         })
 
-    groups = plan_merges(entries, coverage_threshold, max_center_distance)
+    groups = plan_merges(entries, coverage_threshold, max_center_distance,
+                         allow_cross_label=allow_cross_label,
+                         known_labels=known_labels)
     if not groups:
         return detections, masks, geometries
 
@@ -117,8 +150,10 @@ def merge_frame_instances(rgb, depth_m, camera_matrix, camera_to_world,
     merged_detections = list(detections)
     absorbed = set()
     for group in groups:
-        keeper = group[0]
-        for index in group[1:]:
+        # 代表取分数最高的一个；跨标签合并时这意味着「哪个提示词更自信用哪个」。
+        keeper = max(group, key=lambda i: detections[i].score)
+        others = [index for index in group if index != keeper]
+        for index in others:
             absorbed.add(index)
             merged_masks[keeper] = replace(
                 merged_masks[keeper],
@@ -162,6 +197,52 @@ def merge_frame_instances(rgb, depth_m, camera_matrix, camera_to_world,
     )
 
 
+def detections_from_label_map(label_map, instance_info, min_area_pixels=150):
+    """把几何传播得到的标签图还原成 detections / masks 列表。
+
+    传播帧不跑检测，所以标签和分数只能从上一帧继承（存在 `instance_info` 里），
+    框则由传播后的掩码直接取包围盒。可见像素过少的实例视为已出画或被完全遮挡，
+    直接丢弃——否则会把「只剩一条边」的残影继续往下传。
+    """
+
+    detections = []
+    masks = []
+    local_ids = []
+    counts = visible_pixel_counts(label_map)
+
+    for local_id, area in sorted(counts.items()):
+        if area < min_area_pixels:
+            continue
+        info = instance_info.get(local_id)
+        if info is None:
+            continue
+
+        mask = label_map == local_id
+        rows, cols = np.nonzero(mask)
+        box = np.array(
+            [cols.min(), rows.min(), cols.max(), rows.max()],
+            dtype=np.float32,
+        )
+
+        detections.append(
+            Detection(
+                label=info["label"],
+                score=info["score"],
+                box_xyxy=box,
+            )
+        )
+        masks.append(
+            InstanceMask(
+                mask=mask,
+                predicted_iou=info.get("predicted_iou", 0.0),
+                area_pixels=int(area),
+            )
+        )
+        local_ids.append(local_id)
+
+    return detections, masks, local_ids
+
+
 def make_autocast(enabled: bool):
     """半精度推理上下文。
 
@@ -185,7 +266,30 @@ def parse_arguments():
     parser.add_argument("--frames", type=int, nargs="+", required=True)
     parser.add_argument("--classes", nargs="+",
                         default=["computer monitor", "chair", "desk", "trash can", "door", "sofa"])
+    parser.add_argument("--class-groups-file", type=Path, default=None,
+                        help="JSON：[[短语...], [短语...], ...]。给定时每个检测帧只查"
+                             "其中一组并按检测帧序号轮转，降低同批短语间 softmax 竞争。")
+    parser.add_argument("--label-alias-file", type=Path, default=None,
+                        help="JSON：{查询短语: 规范标签}。检出后立刻把标签归一到规范名，"
+                             "使同义说法检出的同一物体能被合并而不是变成重复实例。")
+    # PATCH_LABEL_GATE_V1 / SUPPORT_GATE_V1
+    parser.add_argument("--label-gate", default="off",
+                        choices=["off", "strict", "support"],
+                        help="跨帧关联的标签否决档位：off=不否决；"
+                             "strict=已知标签不同即否决；"
+                             "support=只在家具与非家具之间否决"
+                             "（放在桌子上的纸箱不是桌子的一部分）")
+    # PATCH_GROUPS_ALL_V1
+    parser.add_argument("--groups-per-frame", default="rotate",
+                        choices=["rotate", "all"],
+                        help="rotate=每检测帧只查一组并轮转（物体观测率降为 1/N）；"
+                             "all=每检测帧各组都查一遍并跨组 NMS 去重")
+    parser.add_argument("--group-nms-iou", type=float, default=0.60,
+                        help="跨组 NMS 的框 IoU 阈值")
     parser.add_argument("--box-threshold", type=float, default=0.30)
+    parser.add_argument("--group-box-thresholds", default="",
+                        help="每个提示词组单独的框阈值，逗号分隔，如 0.30,0.20；"
+                             "留空则所有组都用 --box-threshold")
     parser.add_argument("--text-threshold", type=float, default=0.20)
     parser.add_argument("--max-box-area-fraction", type=float, default=0.40)
     parser.add_argument("--pixel-stride", type=int, default=2)
@@ -193,10 +297,26 @@ def parse_arguments():
     parser.add_argument("--voxel-size", type=float, default=0.02)
     parser.add_argument("--voxel-assoc-size", type=float, default=0.05,
                         help="跨帧关联用的体素边长（米）；0 表示不写 voxel_keys")
+    parser.add_argument("--detect-interval", type=int, default=1,
+                        help="每隔多少帧跑一次 Grounding DINO + SAM2；"
+                             "1 表示逐帧检测（原有行为）。>1 时中间帧用深度+位姿"
+                             "把上一帧掩码几何传播过来，不再跑检测与分割")
+    parser.add_argument("--propagate-stride", type=int, default=2,
+                        help="几何传播的像素采样步长；2 时约 11 ms/帧、IoU 0.925，"
+                             "1 为逐像素（约 73 ms/帧、IoU 0.931）")
+    parser.add_argument("--propagate-min-area", type=int, default=150,
+                        help="传播后可见像素少于该值的实例视为已出画/被完全遮挡，丢弃")
+    parser.add_argument("--skip-ply", action="store_true",
+                        help="跳过每帧每实例的点云落盘（纯 IO 开销），测量真实"
+                             "在线性能时应打开")
     parser.add_argument("--merge-coverage", type=float, default=0.0,
                         help="单帧内同标签观测体素覆盖率达到该值即合并；0 表示不合并（默认）")
     parser.add_argument("--merge-max-center-distance", type=float, default=0.80,
                         help="合并时额外的质心距离上限（米）")
+    parser.add_argument("--cross-label-merge", dest="cross_label_merge",
+                        action="store_true", default=False,
+                        help="允许不同标签的观测跨标签合并（同义提示词把同一物体检出"
+                             "两遍时去重），代表取分数更高的标签")
     parser.add_argument("--encoder-weights", type=Path, default=None,
                         help="Stage-5 点式 encoder 权重（提供则提取 shape/clip 嵌入，增强关联）")
     parser.add_argument("--fp16", dest="fp16", action="store_true", default=True,
@@ -205,7 +325,43 @@ def parse_arguments():
                         help="关闭 fp16，用 fp32 复现基线数值")
     parser.add_argument("--write-previews", action="store_true",
                         help="额外写逐帧 matplotlib 3D 预览（慢，默认关以提速）")
-    return parser.parse_args()
+    parser.add_argument("--no-preview", dest="write_previews", action="store_false",
+                        help="显式关闭逐帧 3D 预览（默认已关，保留兼容）")
+    parser.add_argument("--no-fusion", action="store_true",
+                        help="跳过末尾的跨帧实例融合（A/B 实验用，省时间）")
+    args = parser.parse_args()
+    # PATCH_PROMPT_GROUPS_V1：别名归一 + 分组轮转
+    args.label_alias = {}
+    if args.label_alias_file:
+        args.label_alias = json.loads(
+            Path(args.label_alias_file).read_text(encoding="utf-8"))
+        print(f"标签别名：{len(args.label_alias)} 条 -> "
+              f"{len(set(args.label_alias.values()))} 个规范名")
+    args.class_groups = None
+    if args.class_groups_file:
+        groups = json.loads(Path(args.class_groups_file).read_text(encoding="utf-8"))
+        args.class_groups = [g for g in groups if g]
+        flat = []
+        for g in args.class_groups:
+            for c in g:
+                canon = args.label_alias.get(c, c)
+                if canon not in flat:
+                    flat.append(canon)
+        args.classes = flat
+        print(f"提示词分组：{len(args.class_groups)} 组，各组 "
+              f"{[len(g) for g in args.class_groups]} 个短语，"
+              f"规范标签并集 {len(flat)} 类；每个检测帧只查一组并轮转")
+    elif args.label_alias:
+        flat = []
+        for c in args.classes:
+            canon = args.label_alias.get(c, c)
+            if canon not in flat:
+                flat.append(canon)
+        args.classes = flat
+    from src.mapping import geometric_instance_tracker as _git
+    _git.set_known_labels(args.classes)
+    print(f"跟踪器标签集合（{len(_git.KNOWN_LABELS)} 类）：{sorted(_git.KNOWN_LABELS)}")
+    return args
 
 
 def main():
@@ -244,6 +400,12 @@ def main():
     load_start = time.perf_counter()
     sequence = ReplicaSequence(scene_directory)
     detector = GroundingDinoDetector(model_id=args.dino_model)
+    detect_round = 0
+    _group_thresholds = None
+    if args.group_box_thresholds:
+        _group_thresholds = [float(x) for x in args.group_box_thresholds.split(",")]
+        if args.class_groups and len(_group_thresholds) != len(args.class_groups):
+            raise SystemExit("--group-box-thresholds 的个数必须与分组数一致")
     segmenter = Sam2BoxSegmenter(model_id_or_path=args.sam_model)
 
     encoder = None
@@ -277,6 +439,8 @@ def main():
     autocast = make_autocast(args.fp16)
     print(f"2D 前端精度：{'fp16' if args.fp16 and torch.cuda.is_available() else 'fp32'}")
 
+    prev_state = None   # 上一帧的标签图 / 实例元信息 / 深度+位姿，供几何传播使用
+
     for index, frame_index in enumerate(args.frames):
         stages = {}
         frame_start = time.perf_counter()
@@ -284,51 +448,133 @@ def main():
         frame = sequence[frame_index]
         rgb = frame["rgb"]
 
-        sync(); t0 = time.perf_counter()
-        with autocast:
-            detections = detector.predict(
-                rgb=rgb, text_queries=args.classes,
-                box_threshold=args.box_threshold, text_threshold=args.text_threshold,
-                max_box_area_fraction=args.max_box_area_fraction,
-            )
-        sync(); stages["detect"] = (time.perf_counter() - t0) * 1000.0
+        # 检测降频：中间帧不跑 DINO+SAM2，改用深度+位姿把上一帧掩码传播过来。
+        # 传播是纯 CPU numpy，不占 GPU，因此可以与后台检测并行（在线化阶段再拆线程）。
+        use_propagation = (
+            args.detect_interval > 1
+            and prev_state is not None
+            and (index % args.detect_interval) != 0
+        )
 
-        if detections:
-            boxes = np.stack([d.box_xyxy for d in detections])
+        if use_propagation:
             sync(); t0 = time.perf_counter()
-            with autocast:
-                masks = segmenter.predict(rgb=rgb, boxes_xyxy=boxes)
-            sync(); stages["segment"] = (time.perf_counter() - t0) * 1000.0
-        else:
-            masks = []
+            propagated = propagate_instance_masks(
+                prev_depth_m=prev_state["depth_m"],
+                prev_label_map=prev_state["label_map"],
+                cur_depth_m=frame["depth_m"],
+                prev_camera_to_world=prev_state["camera_to_world"],
+                cur_camera_to_world=frame["camera_to_world"],
+                camera_matrix=frame["camera_matrix"],
+                pixel_stride=args.propagate_stride,
+            )
+            propagated = densify_label_map(propagated, args.propagate_stride)
+            sync(); stages["propagate"] = (time.perf_counter() - t0) * 1000.0
+            stages["detect"] = 0.0
             stages["segment"] = 0.0
 
+            detections, masks, local_ids = detections_from_label_map(
+                propagated,
+                prev_state["instances"],
+                min_area_pixels=args.propagate_min_area,
+            )
+            propagated_count = len(detections)
+
+            # 静态场景里世界坐标点云不随相机移动而变，所以传播帧**不需要重新
+            # 做 3D 提升**：直接复用上一帧的几何（含 voxel_keys）。
+            # 这一项就从 ~50 ms 降到接近 0，是达到实时帧率的关键。
+            reused_geometries = prev_state.get("geometries", {})
+            geometries = [
+                reused_geometries[lid]
+                for lid in local_ids
+                if lid in reused_geometries
+            ]
+            # 个别实例可能拿不到上一帧几何（例如刚被合并过），剔除保持三者对齐
+            if len(geometries) != len(detections):
+                keep = [i for i, lid in enumerate(local_ids)
+                        if lid in reused_geometries]
+                detections = [detections[i] for i in keep]
+                masks = [masks[i] for i in keep]
+                local_ids = [local_ids[i] for i in keep]
+            stages["lift"] = 0.0
+        else:
+            sync(); t0 = time.perf_counter()
+            with autocast:
+                # PATCH_GROUPS_ALL_V1：all=各组都查一遍再跨组 NMS；rotate=轮转
+                if args.class_groups and args.groups_per_frame == "all":
+                    _collected = []
+                    for _gi, _g in enumerate(args.class_groups):
+                        _bt = (args.box_threshold if _group_thresholds is None
+                               else _group_thresholds[_gi])
+                        _collected.extend(detector.predict(
+                            rgb=rgb, text_queries=_g,
+                            box_threshold=_bt,
+                            text_threshold=args.text_threshold,
+                            max_box_area_fraction=args.max_box_area_fraction,
+                        ))
+                    detections = nms_detections(_collected, args.group_nms_iou)
+                    detect_round += 1
+                else:
+                    if args.class_groups:
+                        _g = args.class_groups[detect_round % len(args.class_groups)]
+                    else:
+                        _g = args.classes
+                    detect_round += 1
+                    detections = detector.predict(
+                        rgb=rgb, text_queries=_g,
+                        box_threshold=args.box_threshold,
+                        text_threshold=args.text_threshold,
+                        max_box_area_fraction=args.max_box_area_fraction,
+                    )
+                # PATCH_PROMPT_GROUPS_V1：同义说法 -> 规范标签
+                # Detection 是 frozen dataclass，只能用 replace 重建
+                if args.label_alias:
+                    detections = [_dc_replace(
+                        _d, label=args.label_alias.get(_d.label, _d.label))
+                        for _d in detections]
+            sync(); stages["detect"] = (time.perf_counter() - t0) * 1000.0
+
+            if detections:
+                boxes = np.stack([d.box_xyxy for d in detections])
+                sync(); t0 = time.perf_counter()
+                with autocast:
+                    masks = segmenter.predict(rgb=rgb, boxes_xyxy=boxes)
+                sync(); stages["segment"] = (time.perf_counter() - t0) * 1000.0
+            else:
+                masks = []
+                stages["segment"] = 0.0
+            propagated_count = 0
+
         # ---- 3D 提升（进程内）----
-        sync(); t0 = time.perf_counter()
-        geometries = []
-        kept_detections = []
-        kept_masks = []
-        for detection, instance_mask in zip(detections, masks):
-            try:
-                geometry = lift_mask_to_world(
-                    rgb=rgb, depth_m=frame["depth_m"], mask=instance_mask.mask,
-                    camera_matrix=frame["camera_matrix"],
-                    camera_to_world=frame["camera_to_world"],
-                    pixel_stride=args.pixel_stride,
-                    erosion_iterations=args.erosion_iterations,
-                )
-            except ValueError:
-                # 掩码区域内没有有效深度（窗户/玻璃外的远景、反光面、超出量程的
-                # 平面）。扩展类别词表后会稳定遇到这类观测，不能让整条序列崩掉：
-                # 直接丢弃该观测，并保持 detections / masks / geometries 三者对齐。
-                no_depth_skipped += 1
-                continue
-            kept_detections.append(detection)
-            kept_masks.append(instance_mask)
-            geometries.append(geometry)
-        detections = kept_detections
-        masks = kept_masks
-        sync(); stages["lift"] = (time.perf_counter() - t0) * 1000.0
+        # 传播帧已直接复用上一帧几何，跳过反投影。
+        if use_propagation:
+            # 传播帧：几何已复用，不再反投影
+            pass
+        else:
+            sync(); t0 = time.perf_counter()
+            geometries = []
+            kept_detections = []
+            kept_masks = []
+            for detection, instance_mask in zip(detections, masks):
+                try:
+                    geometry = lift_mask_to_world(
+                        rgb=rgb, depth_m=frame["depth_m"], mask=instance_mask.mask,
+                        camera_matrix=frame["camera_matrix"],
+                        camera_to_world=frame["camera_to_world"],
+                        pixel_stride=args.pixel_stride,
+                        erosion_iterations=args.erosion_iterations,
+                    )
+                except ValueError:
+                    # 掩码区域内没有有效深度（窗户/玻璃外的远景、反光面、超出
+                    # 量程的平面）。扩展类别词表后会稳定遇到这类观测，不能让整条
+                    # 序列崩掉：直接丢弃，并保持 detections/masks/geometries 对齐。
+                    no_depth_skipped += 1
+                    continue
+                kept_detections.append(detection)
+                kept_masks.append(instance_mask)
+                geometries.append(geometry)
+            detections = kept_detections
+            masks = kept_masks
+            sync(); stages["lift"] = (time.perf_counter() - t0) * 1000.0
 
         # ---- 合并单帧内的重复 / 过分割观测 ----
         if args.merge_coverage > 0 and len(geometries) > 1:
@@ -342,7 +588,34 @@ def main():
                 max_center_distance=args.merge_max_center_distance,
                 pixel_stride=args.pixel_stride,
                 erosion_iterations=args.erosion_iterations,
+                allow_cross_label=args.cross_label_merge,
+                known_labels=_git.KNOWN_LABELS,
             )
+
+        # ---- 记录本帧状态，供下一帧几何传播 ----
+        # 必须在单帧合并之后构建：masks 已是最终版本。
+        if args.detect_interval > 1:
+            label_map = np.zeros(frame["depth_m"].shape, dtype=np.int32)
+            instance_info = {}
+            for ii, (detection, instance_mask) in enumerate(zip(detections, masks)):
+                label_map[instance_mask.mask] = ii + 1   # 0 留给背景
+                instance_info[ii + 1] = {
+                    "label": detection.label,
+                    "score": detection.score,
+                    "predicted_iou": instance_mask.predicted_iou,
+                }
+            # 几何按 local_id 存档，供下一传播帧直接复用（世界坐标不变）
+            geometry_by_local_id = {
+                ii + 1: geometry
+                for ii, geometry in enumerate(geometries)
+            }
+            prev_state = {
+                "label_map": label_map,
+                "instances": instance_info,
+                "geometries": geometry_by_local_id,
+                "depth_m": frame["depth_m"],
+                "camera_to_world": frame["camera_to_world"],
+            }
 
         # ---- 写 segmentation 产物（与 inspect_grounded_sam2 一致）----
         name = f"frame_{frame_index:06d}"
@@ -373,7 +646,10 @@ def main():
         for ii, (detection, geometry) in enumerate(zip(detections, geometries)):
             label_name = safe_filename(detection.label)
             ply_path = (individual_dir / f"{ii:02d}_{label_name}.ply").resolve()
-            save_point_cloud(ply_path, geometry.points_world, geometry.colors)
+            # 在线/实时场景不该在关键路径上写每帧每实例的 ply：纯 IO 开销，
+            # 与感知无关。需要离线产物时才打开。
+            if not args.skip_ply:
+                save_point_cloud(ply_path, geometry.points_world, geometry.colors)
             entry = {
                 "local_instance_id": ii,
                 "label": detection.label,
@@ -407,11 +683,15 @@ def main():
             json.dumps(lift_records, indent=2, ensure_ascii=False), encoding="utf-8")
 
         total = sum(stages.values())
+        mode = "propagate" if use_propagation else "detect"
         frame_records.append({"frame": frame_index, "stages": stages,
-                               "total_ms": total, "instances": len(geometries)})
+                               "total_ms": total, "instances": len(geometries),
+                               "mode": mode,
+                               "propagated": propagated_count})
+        mark = "  ← 传播" if use_propagation else ""
         print(f"{frame_index:>6} {stages.get('detect', 0):>9.1f} "
               f"{stages.get('segment', 0):>9.1f} {stages.get('lift', 0):>9.1f} "
-              f"{total:>9.1f}  {len(geometries):>4}")
+              f"{total:>9.1f}  {len(geometries):>4}{mark}")
 
     # ---------------- 汇总 ----------------
     measured = frame_records
@@ -441,6 +721,27 @@ def main():
         print(f"单帧均值 {total_mean:.1f} ms → {1000.0 / total_mean:.2f} FPS")
         print(f"  Grounding DINO {det:.1f} ms | SAM2 {seg:.1f} ms | 3D 提升 {lif:.1f} ms")
         print(f"纯 2D 推理 {det + seg:.1f} ms —— 占单帧 {100.0 * (det + seg) / total_mean:.1f}%")
+
+        # 检测降频时，均值和 FPS 会被两类帧混合掩盖，必须分开看：
+        # 真正决定能否跟上采集帧率的是「总耗时 / 总帧数」。
+        detect_frames = [f for f in measured if f["mode"] == "detect"]
+        propagate_frames = [f for f in measured if f["mode"] == "propagate"]
+        if detect_frames and propagate_frames:
+            d_mean = statistics.fmean([f["total_ms"] for f in detect_frames])
+            p_mean = statistics.fmean([f["total_ms"] for f in propagate_frames])
+            p_prop = statistics.fmean(
+                [f["stages"].get("propagate", 0) for f in propagate_frames])
+            print(f"\n检测帧 {len(detect_frames)} 个，均值 {d_mean:.1f} ms；"
+                  f"传播帧 {len(propagate_frames)} 个，均值 {p_mean:.1f} ms"
+                  f"（其中几何传播 {p_prop:.1f} ms）")
+            print(f"折算每帧平均成本 {total_mean:.1f} ms → "
+                  f"可持续帧率 {1000.0 / total_mean:.2f} FPS")
+            latency["detect_frames"] = len(detect_frames)
+            latency["propagate_frames"] = len(propagate_frames)
+            latency["detect_frame_mean_ms"] = round(d_mean, 1)
+            latency["propagate_frame_mean_ms"] = round(p_mean, 1)
+            latency["propagate_only_ms"] = round(p_prop, 1)
+            latency["detect_interval"] = args.detect_interval
     else:
         print("无帧")
 
@@ -462,6 +763,9 @@ def main():
     # 把需要的属性挂到 args 上（finish_sequence 用到）
     args.scene_directory = str(scene_directory)
     args.voxel_size = args.voxel_size
+    # PATCH_NOPREVIEW_FIX_V1：--no-preview 的 dest 是 write_previews，
+    # 而 finish_sequence 读的是 args.no_preview，两边对不上导致预览从未被跳过。
+    args.no_preview = not getattr(args, 'write_previews', True)
     finish_sequence(args, run_directory)
 
 
