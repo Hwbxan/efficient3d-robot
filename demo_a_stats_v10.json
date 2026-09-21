@@ -1,0 +1,333 @@
+{
+  "generated": "2026-09-21 13:28",
+  "run": "outputs/rt8_v10",
+  "protocol": "Replica mesh protocol, kNN 5cm, COCO 101-point AP",
+  "scenes": [
+    {
+      "name": "office0",
+      "label": "Office 0",
+      "frames": 2000,
+      "fps": 34.56,
+      "mean_ms": 28.9,
+      "p95_ms": 270.8,
+      "detect_ms": 361.5,
+      "propagate_ms": 11.4,
+      "detect_frames": 100,
+      "instances": 21,
+      "ap_labeled_all": [
+        0.5479999999999999,
+        0.111,
+        0.019
+      ],
+      "ap_labeled_seen": [
+        0.868,
+        0.17300000000000001,
+        0.028999999999999998
+      ],
+      "ap_agnostic_all": [
+        0.584,
+        0.16699999999999998,
+        0.019
+      ],
+      "ap_agnostic_seen": [
+        0.9209999999999999,
+        0.264,
+        0.028999999999999998
+      ],
+      "ap_labeled_all_strict": [
+        0.38799999999999996,
+        0.07200000000000001,
+        0.012
+      ]
+    },
+    {
+      "name": "office1",
+      "label": "Office 1",
+      "frames": 2000,
+      "fps": 34.87,
+      "mean_ms": 28.7,
+      "p95_ms": 273.2,
+      "detect_ms": 361.5,
+      "propagate_ms": 11.2,
+      "detect_frames": 100,
+      "instances": 18,
+      "ap_labeled_all": [
+        0.42100000000000004,
+        0.261,
+        0.125
+      ],
+      "ap_labeled_seen": [
+        0.882,
+        0.5479999999999999,
+        0.259
+      ],
+      "ap_agnostic_all": [
+        0.47600000000000003,
+        0.261,
+        0.125
+      ],
+      "ap_agnostic_seen": [
+        0.93,
+        0.5479999999999999,
+        0.259
+      ],
+      "ap_labeled_all_strict": [
+        0.20600000000000002,
+        0.083,
+        0.083
+      ]
+    },
+    {
+      "name": "office2",
+      "label": "Office 2",
+      "frames": 2000,
+      "fps": 34.17,
+      "mean_ms": 29.3,
+      "p95_ms": 321.3,
+      "detect_ms": 379.9,
+      "propagate_ms": 10.8,
+      "detect_frames": 100,
+      "instances": 30,
+      "ap_labeled_all": [
+        0.516,
+        0.26,
+        0.133
+      ],
+      "ap_labeled_seen": [
+        0.7390000000000001,
+        0.36700000000000005,
+        0.18600000000000003
+      ],
+      "ap_agnostic_all": [
+        0.551,
+        0.26,
+        0.133
+      ],
+      "ap_agnostic_seen": [
+        0.787,
+        0.36700000000000005,
+        0.18600000000000003
+      ],
+      "ap_labeled_all_strict": [
+        0.228,
+        0.045,
+        0.002
+      ]
+    },
+    {
+      "name": "office3",
+      "label": "Office 3",
+      "frames": 2000,
+      "fps": 32.55,
+      "mean_ms": 30.7,
+      "p95_ms": 352.5,
+      "detect_ms": 403.1,
+      "propagate_ms": 11.1,
+      "detect_frames": 100,
+      "instances": 35,
+      "ap_labeled_all": [
+        0.32,
+        0.127,
+        0.034
+      ],
+      "ap_labeled_seen": [
+        0.547,
+        0.215,
+        0.059000000000000004
+      ],
+      "ap_agnostic_all": [
+        0.34,
+        0.127,
+        0.034
+      ],
+      "ap_agnostic_seen": [
+        0.588,
+        0.215,
+        0.059000000000000004
+      ],
+      "ap_labeled_all_strict": [
+        0.172,
+        0.032,
+        0.0
+      ]
+    },
+    {
+      "name": "office4",
+      "label": "Office 4",
+      "frames": 2000,
+      "fps": 34.39,
+      "mean_ms": 29.1,
+      "p95_ms": 322.7,
+      "detect_ms": 376.6,
+      "propagate_ms": 10.8,
+      "detect_frames": 100,
+      "instances": 33,
+      "ap_labeled_all": [
+        0.629,
+        0.166,
+        0.03
+      ],
+      "ap_labeled_seen": [
+        0.8059999999999999,
+        0.212,
+        0.038
+      ],
+      "ap_agnostic_all": [
+        0.629,
+        0.166,
+        0.03
+      ],
+      "ap_agnostic_seen": [
+        0.8059999999999999,
+        0.212,
+        0.038
+      ],
+      "ap_labeled_all_strict": [
+        0.551,
+        0.131,
+        0.022000000000000002
+      ]
+    },
+    {
+      "name": "room0",
+      "label": "Room 0",
+      "frames": 2000,
+      "fps": 32.65,
+      "mean_ms": 30.6,
+      "p95_ms": 347.8,
+      "detect_ms": 407.4,
+      "propagate_ms": 10.8,
+      "detect_frames": 100,
+      "instances": 39,
+      "ap_labeled_all": [
+        0.44,
+        0.106,
+        0.01
+      ],
+      "ap_labeled_seen": [
+        0.609,
+        0.149,
+        0.015
+      ],
+      "ap_agnostic_all": [
+        0.43200000000000005,
+        0.126,
+        0.01
+      ],
+      "ap_agnostic_seen": [
+        0.598,
+        0.17800000000000002,
+        0.015
+      ],
+      "ap_labeled_all_strict": [
+        0.20800000000000002,
+        0.026000000000000002,
+        0.003
+      ]
+    },
+    {
+      "name": "room1",
+      "label": "Room 1",
+      "frames": 2000,
+      "fps": 34.88,
+      "mean_ms": 28.7,
+      "p95_ms": 268.2,
+      "detect_ms": 373.7,
+      "propagate_ms": 10.5,
+      "detect_frames": 100,
+      "instances": 30,
+      "ap_labeled_all": [
+        0.29,
+        0.057,
+        0.011000000000000001
+      ],
+      "ap_labeled_seen": [
+        0.36700000000000005,
+        0.07,
+        0.013999999999999999
+      ],
+      "ap_agnostic_all": [
+        0.34,
+        0.079,
+        0.011000000000000001
+      ],
+      "ap_agnostic_seen": [
+        0.423,
+        0.102,
+        0.013999999999999999
+      ],
+      "ap_labeled_all_strict": [
+        0.25,
+        0.031,
+        0.002
+      ]
+    },
+    {
+      "name": "room2",
+      "label": "Room 2",
+      "frames": 2000,
+      "fps": 33.85,
+      "mean_ms": 29.5,
+      "p95_ms": 296.6,
+      "detect_ms": 385.9,
+      "propagate_ms": 10.8,
+      "detect_frames": 100,
+      "instances": 25,
+      "ap_labeled_all": [
+        0.244,
+        0.08900000000000001,
+        0.044000000000000004
+      ],
+      "ap_labeled_seen": [
+        0.494,
+        0.171,
+        0.078
+      ],
+      "ap_agnostic_all": [
+        0.337,
+        0.134,
+        0.044000000000000004
+      ],
+      "ap_agnostic_seen": [
+        0.687,
+        0.263,
+        0.078
+      ],
+      "ap_labeled_all_strict": [
+        0.244,
+        0.08900000000000001,
+        0.044000000000000004
+      ]
+    }
+  ],
+  "summary": {
+    "fps_mean": 33.99,
+    "fps_min": 32.55,
+    "instances": 231,
+    "ap_labeled_all": [
+      0.426,
+      0.147125,
+      0.05075
+    ],
+    "ap_agnostic_all": [
+      0.461125,
+      0.165,
+      0.05075
+    ],
+    "ap_labeled_seen": [
+      0.664,
+      0.238125,
+      0.08475
+    ],
+    "ap_agnostic_seen": [
+      0.7175,
+      0.268625,
+      0.08475
+    ],
+    "ap_labeled_all_strict": [
+      0.280875,
+      0.063625,
+      0.021
+    ]
+  }
+}
