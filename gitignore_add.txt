@@ -1,17 +1,3 @@
-__pycache__/
-*.pyc
-datasets/
-checkpoints/
-downloads/
-outputs/
-deploy/
-
-# RKNN 标定/导出中间产物（可从数据集重生成）
-check_external_data/
-
-# 下载/解压的中间产物
-*.zip
-*.log
 
 # ---- 实验日志 / 一次性产物 ----
 *.out
