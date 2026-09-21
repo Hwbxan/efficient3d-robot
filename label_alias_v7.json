@@ -1,0 +1,17 @@
+{
+  "ceiling light": "lamp",
+  "recessed light": "lamp",
+  "light fixture": "lamp",
+  "wall clock": "clock",
+  "security camera": "camera",
+  "webcam": "camera",
+  "books": "book",
+  "stack of books": "book",
+  "water bottle": "bottle",
+  "plastic bottle": "bottle",
+  "paper plate": "plate",
+  "cardboard box": "box",
+  "box of tissues": "tissue box",
+  "electronic tablet": "tablet",
+  "bin": "trash can"
+}

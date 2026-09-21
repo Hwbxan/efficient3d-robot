@@ -15,6 +15,7 @@ rewritten into an NPU-deployable form and shipped to a Rockchip RK3588 (6 TOPS I
 - [效果](#效果)
 - [这是什么](#这是什么)
 - [系统架构](#系统架构)
+- [Demo A 阶段汇总（v11 定稿）](docs/DEMO_A_V11.md)
 - [量化结果](#量化结果)
 - [快速开始](#快速开始)
 - [目录结构](#目录结构)
@@ -31,27 +32,42 @@ rewritten into an NPU-deployable form and shipped to a Rockchip RK3588 (6 TOPS I
 ![3D instance tracking](docs/assets/tracking_contact_sheet.png)
 
 在 Replica 的 **8 个 Nice-SLAM RGB-D 标准场景**（office_0–4、room_0–2，
-每场景 200 帧、步长 10）上，与官方语义网格反投影出的 GT 实例掩码对比
-（宏平均，逐场景指标见 [`docs/RESULTS.md`](docs/RESULTS.md) §1.5）：
+每场景 **2000 连续帧**，模拟深度相机实时采集）上，按 **Replica 网格协议**评测
+（kNN 5 cm 把重建实例投影到 GT mesh，逐顶点 IoU，COCO 101 点插值 ——
+与 OVI-MAP / OVO-SLAM 同一口径）：
 
 | 指标 | 数值 |
 |---|---|
-| 实例 AP@IoU 0.25 | **0.608** |
-| 实例 AP@IoU 0.50 | **0.519** |
-| 关联：GT 对象单轨保持率 | **0.706** |
-| 关联：轨道碎片率 | **1.363**（越低越好，1.0 为完美） |
-| 语义标签一致性 | **0.984** |
+| **AP@.25**（labeled / all，论文口径） | **45.2** |
+| **AP@.50** | **21.6** |
+| **AP@.75** | **7.0** |
+| AP@.25（class-agnostic，几何上界） | 46.9 |
+| 平均吞吐 | **34.0 FPS**（最慢场景 32.6） |
+| 跨帧全局一致 3D 实例 | 231 |
 
-**开放词汇文本检索**（CLIP 图像嵌入 × 文本查询，6 类常见词，按「物体存在」
-的场景宏平均 AP）：chair 0.84 / trash can 0.82 / sofa 0.77 / desk 0.73 /
-door 0.63 / computer monitor 0.23（显示器召回 100%，弱在检索排序，见局限）。
+与文献对比：
 
-**实时性**：RTX 3090 单进程在线推理 **6.15 FPS（162 ms/帧）**，瓶颈是
-Grounding DINO（~130 ms）。
+| 方法 | AP@.25 | AP@.50 | AP@.75 |
+|---|---|---|---|
+| OVI-MAP（CVPR 2026，离线全局优化） | 76.7 | 50.8 | 22.0 |
+| **本系统（在线 34 FPS）** | **45.2** | **21.6** | **7.0** |
+| OVO-SLAM（RA-L 2025） | 32.8 | 23.6 | 11.1 |
 
-> 单场景老口径（office0 61 帧）：AP@.25 0.703、单轨率 0.556、标签一致性 0.975，
-> 见 RESULTS.md §1。多场景把单轨率从 0.556 提到 0.706、碎片率从 1.77 降到 1.36，
-> 关键是改用体素覆盖率关联修掉了 track 碎片化。
+AP@.25 领先 OVO-SLAM 12.4 分；AP@.50 / .75 仍落后 2.0 / 4.1 ——
+我们能找到物体，但分割边界不够准。
+
+完整指标、差距归因与复现步骤见 **[`docs/DEMO_A_V11.md`](docs/DEMO_A_V11.md)**，
+全部实验记录见 [`docs/RESULTS.md`](docs/RESULTS.md)。
+
+**实时性**：RTX 3090 单进程在线推理 **34.0 FPS**，检测帧 381 ms / 传播帧 10.9 ms
+（每 20 帧跑一次检测，中间 19 帧走纯几何传播）。
+
+**开放词汇文本检索**：每个全局实例带 CLIP 图像嵌入，支持任意文本查询
+（交互查看器见 `docs/DEMO_A_V11.md`）。
+
+> 早期版本用"逐帧 2D 掩码 vs 逐帧 GT 掩码"评测（200 帧、步长 10），
+> 报 AP@.25 0.608 / AP@.50 0.519、6.15 FPS。那套口径与文献不可比，已废弃，
+> 保留在 `docs/RESULTS.md` 的历史记录里。
 
 ---
 

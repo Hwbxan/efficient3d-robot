@@ -1,0 +1,22 @@
+[
+  [
+    "chair", "table", "desk", "sofa", "bed", "cabinet", "shelf",
+    "door", "tv screen", "monitor", "bench", "nightstand", "tv stand",
+    "potted plant", "plant stand"
+  ],
+  [
+    "cushion", "pillow", "blanket", "comforter", "cloth",
+    "vase", "candle", "picture frame", "sculpture", "basket"
+  ],
+  [
+    "trash can", "bin", "bottle", "water bottle", "plastic bottle",
+    "bowl", "plate", "paper plate", "box", "cardboard box",
+    "tissue box", "box of tissues", "desk organizer",
+    "book", "books", "stack of books"
+  ],
+  [
+    "lamp", "ceiling light", "recessed light", "light fixture",
+    "clock", "wall clock", "camera", "security camera", "webcam",
+    "tablet", "electronic tablet", "pot", "stool"
+  ]
+]
