@@ -100,7 +100,7 @@ log_obs, log_fo, log_vox, fill, ext, det_max, area, fo_f5, mfvr, input_pts + 类
 8 个场景的 AP@.50 **全部提升**（office4 16.6→35.7，office3 12.7→22.3）。
 
 脚本：`scripts/quality/dump_rank_feat.py`（抽特征）→ `scripts/quality/fit_rank.py` / `scripts/quality/fit_rank2.py`（建模对比）
-→ `scripts/quality/apply_quality_score.py`（写回 `quality_score`）→ `scripts/quality/patch_eval_score.py`（评测读取）。
+→ `scripts/quality/apply_quality_score.py`（写回 `quality_score`）→ 评测器 `eval_mesh_protocol.py` 改为优先读取 `quality_score`。
 
 ---
 

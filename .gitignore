@@ -1,10 +1,10 @@
 __pycache__/
 *.pyc
-datasets/
-checkpoints/
-downloads/
-outputs/
-deploy/
+/datasets/
+/checkpoints/
+/downloads/
+/outputs/
+/deploy/
 
 # RKNN 标定/导出中间产物（可从数据集重生成）
 check_external_data/

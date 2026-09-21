@@ -1387,7 +1387,7 @@ det_max / area / fo_f5 / mfvr / input_pts + 类别先验）映射到真实 IoU�
 
 `fo_mean` 单独就已经 6/8 场景变好（AP50 +2.84 ± 1.46）；Ridge 再往上拿 3.4 分 AP@.50。
 打分器写回 `instance_map.json` 的 `quality_score`，`load_prediction` 优先读它。
-脚本：`dump_rank_feat.py` / `fit_rank.py` / `fit_rank2.py` / `apply_quality_score.py` / `patch_eval_score.py`
+脚本：`scripts/quality/dump_rank_feat.py` / `scripts/quality/fit_rank.py` / `scripts/quality/fit_rank2.py` / `scripts/quality/apply_quality_score.py`；评测侧读取 `quality_score` 的改动已内联进 `eval_mesh_protocol.py`
 
 #### v11 全口径结果（8 场景宏平均）
 
