@@ -4,13 +4,46 @@ from pathlib import Path
 
 from src.mapping.geometric_instance_tracker import (
     GeometricInstanceTracker,
+    set_known_labels,
 )
 from tools.check_instance_pairs import load_observations
+
+
+# PATCH_KNOWN_LABELS_V1
+def collect_observed_labels(instances_root, frames):
+    """兜底：没有显式 --classes 时，直接从实例 JSON 里收集出现过的标签。
+
+    检测器输出的 label 就是提示词原文，所以当上层忘记透传 --classes 时，
+    用它自己产生的标签当白名单是最贴近事实的选择——总好过退回硬编码的
+    8 个默认类别，把新类别全部丢成 unknown。
+    """
+
+    labels = set()
+
+    for frame_index in frames:
+        metadata_path = (
+            instances_root / f"frame_{frame_index:06d}" / "instances_3d.json"
+        )
+        if not metadata_path.is_file():
+            continue
+        with metadata_path.open("r", encoding="utf-8") as file:
+            for item in json.load(file):
+                text = str(item.get("label", "")).strip().lower()
+                if text:
+                    labels.add(text)
+
+    return sorted(labels)
 
 
 def main():
     parser = ArgumentParser()
 
+    # PATCH_LABEL_GATE_V1
+    parser.add_argument("--label-gate", default="off",
+                        choices=["off", "strict", "support"],
+                        help="标签否决门控档位：off=不否决，"
+                             "strict=已知标签不同即否决，"
+                             "support=只在家具与非家具之间否决")
     parser.add_argument(
         "--instances-root",
         type=Path,
@@ -27,8 +60,31 @@ def main():
         type=Path,
         default=Path("outputs/association/two_frame_tracking.json"),
     )
+    parser.add_argument(
+        "--classes",
+        nargs="+",
+        default=None,
+        help="当前提示词列表；缺省时自动从实例 JSON 收集。",
+    )
 
     arguments = parser.parse_args()
+
+    # PATCH_KNOWN_LABELS_ARGS_V1
+    # 标签白名单必须在建轨之前注入，否则不在默认白名单里的类别拿不到投票，
+    # 融合结果会整体退化成 unknown。
+    known_labels = arguments.classes
+    if not known_labels:
+        known_labels = collect_observed_labels(
+            arguments.instances_root,
+            arguments.frames,
+        )
+    if known_labels:
+        set_known_labels(known_labels)
+        print(
+            f"标签白名单（{len(known_labels)} 类）："
+            f"{', '.join(known_labels)}",
+            flush=True,
+        )
 
     if any(
         current <= previous
@@ -39,7 +95,9 @@ def main():
     ):
         raise ValueError("--frames 必须严格递增")
 
-    tracker = GeometricInstanceTracker()
+    tracker = GeometricInstanceTracker(
+        label_gate=(arguments.label_gate != "off"),
+        label_gate_mode=arguments.label_gate)  # SUPPORT_GATE_V1
     frame_results = []
 
     for frame_index in arguments.frames:

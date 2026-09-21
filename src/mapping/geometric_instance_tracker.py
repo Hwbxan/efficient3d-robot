@@ -5,14 +5,40 @@ import numpy as np
 from scipy.optimize import linear_sum_assignment
 
 
-KNOWN_LABELS = {
+# 默认标签集合。实际使用时应由调用方通过 set_known_labels() 注入当前提示词，
+# 而不是硬编码 —— 硬编码曾导致换提示词后新类别全被丢成 "unknown"。
+DEFAULT_KNOWN_LABELS = {
     "computer monitor",
+    "tv screen",
     "chair",
     "desk",
+    "table",
     "trash can",
     "door",
     "sofa",
 }
+
+KNOWN_LABELS = set(DEFAULT_KNOWN_LABELS)
+
+
+def set_known_labels(labels):
+    """由序列推理器注入当前使用的提示词集合。"""
+    global KNOWN_LABELS
+    KNOWN_LABELS = {label.strip() for label in labels if label and label.strip()}
+    return KNOWN_LABELS
+
+
+# 「家具 / 承载面」类别：别的物体会放在它们上面或里面。
+# 与「非家具」标签之间一律否决合并——放在桌子上的纸箱不是桌子的一部分。
+SUPPORT_SURFACES = {
+    "table", "desk", "shelf", "cabinet", "bookcase", "dresser", "counter",
+    "bed", "sofa", "couch", "chair", "armchair", "bench", "stool", "seat",
+    "nightstand", "tv stand", "plant stand", "door", "ottoman", "refrigerator",
+}
+
+
+def is_support_surface(label):
+    return str(label).strip().lower() in SUPPORT_SURFACES
 
 
 @dataclass
@@ -188,6 +214,7 @@ class GeometricInstanceTracker:
         unmatched_cost=0.80,
         ambiguity_margin=0.0,
         label_gate=False,
+        label_gate_mode="strict",
         shape_weight=0.25,
         memory_frames=30,
         reacquire_max_center_distance=1.5,
@@ -226,6 +253,12 @@ class GeometricInstanceTracker:
         # 用标签做合并否决既符合 GT，又不影响同类物体的跨帧聚合。unknown 标签
         # （检测器没给出已知类别）不参与否决，避免把没标签的轨道锁死。
         self.label_gate = label_gate
+        # off=不否决 / strict=已知标签不同即否决 / support=只在家具与非家具之间否决
+        if label_gate_mode not in ("off", "strict", "support"):
+            raise ValueError("label_gate_mode 必须是 off/strict/support")
+        self.label_gate_mode = (
+            "off" if not label_gate else label_gate_mode
+        )
         self.shape_weight = shape_weight
         # 重新捕获：物体短暂消失后重现时，相机已移动，其质心可能距旧轨最后
         # 位置超过常规门限；对「近期出现过（last_seen 在 memory_frames 内）」
@@ -317,22 +350,32 @@ class GeometricInstanceTracker:
         return 1.0
 
     def _label_conflict(self, observation, track):
-        """两个已知类别不同的观测不应是同一实例——直接否决合并。
+        """两个观测是否「不可能是同一个实例」。
 
-        只在两者都是 KNOWN_LABELS 且不同、且轨道已确定标签时生效；
-        unknown 标签的轨道（检测器没给出已知类别）不参与，避免把没标签的
-        轨道锁死、也保留「未分类物体照常靠几何聚合」的原有行为。
+        off      不否决（体素覆盖率单独说话）；
+        strict   两个已知类别不同就否决——会误伤 desk/table 这类同义提示词；
+        support  只在「家具 / 承载面」与「非家具」之间否决：放在桌子上的纸箱
+                 不是桌子的一部分，但 desk 与 table 仍然允许合并。
         """
 
-        if not self.label_gate:
+        if self.label_gate_mode == "off":
             return False
+
         observed_label = observation["label"].strip().lower()
-        if observed_label not in KNOWN_LABELS:
-            return False
         track_label = track.label
         if track_label == "unknown":
             return False
+
+        if self.label_gate_mode == "support":
+            # 只有两边标签都认识时才否决，避免检测器偶尔给出的杂标签锁死轨道。
+            if observed_label not in KNOWN_LABELS or track_label not in KNOWN_LABELS:
+                return False
+            return is_support_surface(observed_label) != is_support_surface(track_label)
+
+        if observed_label not in KNOWN_LABELS:
+            return False
         return observed_label != track_label
+
 
     def _shape_cost(self, observation, track):
         """返回 (shape_cost, has_shape)；无 shape embedding 时 has_shape=False。"""
