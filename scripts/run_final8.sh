@@ -21,8 +21,8 @@ for s in office0 office1 office2 office3 office4 room0 room1 room2; do
     --scene-directory datasets/processed/Replica/$s \
     --run-directory $OUT/$s --frames $FRAMES \
     --dino-model checkpoints/grounding-dino-base --sam-model $SAM \
-    --class-groups-file class_groups_v8.json \
-    --label-alias-file label_alias_v7.json \
+    --class-groups-file config/class_groups_v8.json \
+    --label-alias-file config/label_alias_v7.json \
     --groups-per-frame all --group-nms-iou 0.60 \
     --box-threshold 0.30 \
     --detect-interval $INTERVAL --propagate-stride 2 --propagate-min-area 150 \

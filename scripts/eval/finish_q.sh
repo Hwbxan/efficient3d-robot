@@ -4,7 +4,7 @@ cd /data/efficient3d_robot
 export FUSION_DIR=fusion_attempt_01
 PY=/miniconda3/bin/python3
 
-$PY apply_quality_score.py --run-root outputs/rt8_v10 \
+$PY scripts/quality/apply_quality_score.py --run-root outputs/rt8_v10 \
     --train-mode labeled --out qs_labeled.json 2>&1 | tail -2
 
 $PY eval_mesh_protocol.py --run-root outputs/rt8_v10 \

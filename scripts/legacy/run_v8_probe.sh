@@ -14,8 +14,8 @@ for s in office2 room0; do
     --scene-directory datasets/processed/Replica/$s \
     --run-directory $OUTROOT/$s --frames $FRAMES \
     --dino-model checkpoints/grounding-dino-base --sam-model $SAM \
-    --class-groups-file class_groups_v8.json \
-    --label-alias-file label_alias_v7.json \
+    --class-groups-file config/class_groups_v8.json \
+    --label-alias-file config/label_alias_v7.json \
     --groups-per-frame all --group-nms-iou 0.60 \
     --box-threshold 0.30 \
     --detect-interval 20 --propagate-stride 2 --propagate-min-area 150 \

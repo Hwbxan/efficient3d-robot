@@ -8,7 +8,7 @@ $PY -u -m tools.run_sequence_efficient \
   --dino-model checkpoints/grounding-dino-base \
   --sam-model checkpoints/sam2.1-hiera-base-plus \
   --class-groups-file class_groups_v7.json \
-  --label-alias-file label_alias_v7.json \
+  --label-alias-file config/label_alias_v7.json \
   --box-threshold 0.30 --detect-interval 10 --propagate-stride 2 \
   --propagate-min-area 150 --pixel-stride 2 --merge-coverage 0.5 \
   --cross-label-merge --no-preview 2>&1 | head -40

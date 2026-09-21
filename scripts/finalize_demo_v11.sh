@@ -15,7 +15,7 @@ SCENES="office0 office1 office2 office3 office4 room0 room1 room2"
 echo "############ $(date +%H:%M:%S) 0/4 实例质量打分器 ############"
 # 留一场景交叉验证：预测某场景时只许用其余 7 个场景训练。
 # 注意这一步需要 Replica 标注来算回归目标 IoU（离线标定，不在推理路径上）。
-FUSION_DIR=fusion_attempt_01 $PY -u apply_quality_score.py \
+FUSION_DIR=fusion_attempt_01 $PY -u scripts/quality/apply_quality_score.py \
   --run-root $RUNROOT --train-mode labeled --alpha 3.0 \
   --out outputs/quality_scores_v11.json \
   > outputs/apply_quality_score_v11.log 2>&1

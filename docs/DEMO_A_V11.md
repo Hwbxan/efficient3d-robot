@@ -99,8 +99,8 @@ log_obs, log_fo, log_vox, fill, ext, det_max, area, fo_f5, mfvr, input_pts + 类
 
 8 个场景的 AP@.50 **全部提升**（office4 16.6→35.7，office3 12.7→22.3）。
 
-脚本：`dump_rank_feat.py`（抽特征）→ `fit_rank.py` / `fit_rank2.py`（建模对比）
-→ `apply_quality_score.py`（写回 `quality_score`）→ `patch_eval_score.py`（评测读取）。
+脚本：`scripts/quality/dump_rank_feat.py`（抽特征）→ `scripts/quality/fit_rank.py` / `scripts/quality/fit_rank2.py`（建模对比）
+→ `scripts/quality/apply_quality_score.py`（写回 `quality_score`）→ `scripts/quality/patch_eval_score.py`（评测读取）。
 
 ---
 
@@ -184,10 +184,10 @@ room_1 的 AP@.50 从 5.7 掉到 3.1 —— 错误标签抢占了 GT 的占用�
 
 ```bash
 # 1. 跑 8 场景（需要 Grounding DINO / SAM 2 权重，见 checkpoints/）
-bash run_final8.sh rt8_v10 20 support
+bash scripts/run_final8.sh rt8_v10 20 support
 
 # 2. 定稿流程：打分器 → 嵌入 → 查看器数据 → 视频 → 复测 5 口径
-bash finalize_demo_v11.sh
+bash scripts/finalize_demo_v11.sh
 ```
 
 `finalize_demo_v11.sh` 的第 0 步就是打分器。它是离线标定步骤
@@ -203,5 +203,5 @@ FUSION_DIR=fusion_attempt_01 python3 eval_mesh_protocol.py \
 差距归因：
 
 ```bash
-FUSION_DIR=fusion_attempt_01 python3 diag_gap.py --run-root outputs/rt8_v10
+FUSION_DIR=fusion_attempt_01 python3 scripts/eval/diag_gap.py --run-root outputs/rt8_v10
 ```
